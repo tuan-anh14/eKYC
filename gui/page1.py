@@ -1,4 +1,4 @@
-from PyQt5.QtCore import QPoint, QRect, Qt, QTimer
+from PyQt5.QtCore import QPoint, QRect, Qt, QTimer, QThread, QObject, pyqtSignal
 from PyQt5.QtGui import QFont, QImage, QPainter, QPen, QPixmap
 from PyQt5.QtWidgets import (QApplication, QDialog, QFileDialog, QHBoxLayout,
                              QLabel, QMainWindow, QPushButton, QStackedWidget,
@@ -150,52 +150,67 @@ class IDCardPhoto(QWidget):
             }
     
     def extractInfo(self):
-        """Chạy OCR và hiển thị kết quả"""
+        """Chạy OCR trên background thread để UI không đơ"""
         if not self.img_path:
             QMessageBox.warning(self, "Cảnh báo", "Vui lòng chọn ảnh CCCD trước.")
             return
-        
-        try:
-            # Đọc ảnh và chạy OCR
-            img = cv.imread(self.img_path)
-            if img is None:
-                QMessageBox.critical(self, "Lỗi", "Không thể đọc ảnh. Vui lòng thử lại.")
-                return
-            
-            # Hiển thị thông báo đang xử lý
-            self.error_label.setText("Đang trích xuất thông tin từ ảnh...")
-            self.error_label.setStyleSheet("color: blue;")
-            self.error_label.setGeometry(QRect(1000, 100, 500, 30))
+
+        class OCRWorker(QObject):
+            finished = pyqtSignal(dict, tuple)
+            failed = pyqtSignal(str)
+            def __init__(self, path):
+                super().__init__()
+                self.path = path
+            def run(self):
+                try:
+                    img = cv.imread(self.path)
+                    if img is None:
+                        raise ValueError("Không thể đọc ảnh")
+                    fields = extract_id_fields(img)
+                    valid = validate_ocr_result(fields)
+                    self.finished.emit(fields, valid)
+                except Exception as e:
+                    self.failed.emit(str(e))
+
+        # Thông báo đang xử lý
+        self.error_label.setText("Đang trích xuất thông tin từ ảnh...")
+        self.error_label.setStyleSheet("color: blue;")
+        self.error_label.setGeometry(QRect(1000, 100, 500, 30))
+        self.error_label.show()
+
+        # Disable buttons trong lúc xử lý
+        self.extract_button.setDisabled(True)
+        self.next.setDisabled(True)
+
+        # Khởi tạo và chạy thread
+        self._ocr_thread = QThread(self)
+        self._ocr_worker = OCRWorker(self.img_path)
+        self._ocr_worker.moveToThread(self._ocr_thread)
+        self._ocr_thread.started.connect(self._ocr_worker.run)
+        self._ocr_worker.finished.connect(self._on_ocr_finished)
+        self._ocr_worker.failed.connect(self._on_ocr_failed)
+        self._ocr_worker.finished.connect(self._ocr_thread.quit)
+        self._ocr_worker.failed.connect(self._ocr_thread.quit)
+        self._ocr_thread.start()
+
+    def _on_ocr_finished(self, fields, valid_tuple):
+        self.ocr_fields = fields
+        is_valid, error_msg = valid_tuple
+        self.error_label.hide()
+        self._display_ocr_fields()
+        if not is_valid:
+            self.error_label.setText(error_msg)
+            self.error_label.setStyleSheet("color: red;")
+            self.error_label.setGeometry(QRect(1000, 100, 500, 50))
             self.error_label.show()
-            QApplication.processEvents()  # Cập nhật UI
-            
-            # Chạy OCR
-            self.ocr_fields = extract_id_fields(img)
-            
-            # Validate kết quả
-            is_valid, error_msg = validate_ocr_result(self.ocr_fields)
-            
-            # Ẩn thông báo đang xử lý
-            self.error_label.hide()
-            
-            if not is_valid:
-                self.error_label.setText(error_msg)
-                self.error_label.setStyleSheet("color: red;")
-                self.error_label.setGeometry(QRect(1000, 100, 500, 50))
-                self.error_label.show()
-            else:
-                self.error_label.hide()
-            
-            # Hiển thị kết quả OCR
-            self._display_ocr_fields()
-            
-            # Enable nút Next nếu OCR hợp lệ
-            if is_valid:
-                self.next.setDisabled(False)
-            
-        except Exception as e:
-            QMessageBox.critical(self, "Lỗi", f"Lỗi khi trích xuất thông tin: {str(e)}")
-            self.error_label.hide()
+        else:
+            self.next.setDisabled(False)
+        self.extract_button.setDisabled(False)
+
+    def _on_ocr_failed(self, msg):
+        QMessageBox.critical(self, "Lỗi", f"Lỗi khi trích xuất thông tin: {msg}")
+        self.error_label.hide()
+        self.extract_button.setDisabled(False)
     
     def _display_ocr_fields(self):
         """Hiển thị các trường OCR trên UI"""
