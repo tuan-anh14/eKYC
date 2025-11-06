@@ -53,6 +53,13 @@ def _normalize(s: str) -> str:
     s = unicodedata.normalize("NFC", s)
     return re.sub(r"\s+", " ", s).strip()
 
+def _dbg(*args):
+    if os.environ.get('OCR_DEBUG', '0') == '1':
+        try:
+            print('[OCR_DEBUG]', *args)
+        except Exception:
+            pass
+
 def _ensure_bgr(image):
     """Đảm bảo ảnh đầu vào là BGR 3 kênh."""
     if image is None:
@@ -139,46 +146,38 @@ def _ocr_collect_lines(ocr: PaddleOCR, image) -> Tuple[List[str], List[float]]:
                     confs.append(1.0)
     return lines, confs
 
-def _ocr_collect_with_crops(ocr: PaddleOCR, image_bgr) -> List[Tuple[str, float, any]]:
-    """Thu thập (text, conf, crop_bgr) bằng PaddleOCR để refine với VietOCR."""
-    items: List[Tuple[str, float, any]] = []
+def _ocr_collect_with_crops(ocr: PaddleOCR, image_bgr) -> List[Tuple[str, float, any, List[List[int]]]]:
+    """Thu thập (text, conf, crop_bgr, box) từ PaddleOCR (ưu tiên dùng cls để ổn định góc)."""
+    items: List[Tuple[str, float, any, List[List[int]]]] = []
     try:
-        result = ocr.ocr(_ensure_bgr(image_bgr))
+        result = ocr.ocr(_ensure_bgr(image_bgr), cls=True)
     except Exception:
         try:
             result = ocr.predict(_ensure_bgr(image_bgr))
         except Exception:
             return items
-    if isinstance(result, list):
-        for page in result:
-            if not page:
-                continue
-            for line in page:
-                try:
-                    box = line[0]
-                    rec = line[1]
-                    if isinstance(rec, (list, tuple)) and len(rec) >= 2:
-                        txt = str(rec[0])
-                        conf = float(rec[1]) if rec[1] is not None else 1.0
-                    elif isinstance(rec, dict):
-                        txt = str(rec.get('text', ''))
-                        conf = float(rec.get('confidence', 1.0))
-                    else:
-                        txt = str(rec)
-                        conf = 1.0
-                    x_coords = [int(p[0]) for p in box]
-                    y_coords = [int(p[1]) for p in box]
-                    x1, y1 = max(0, min(x_coords)), max(0, min(y_coords))
-                    x2, y2 = max(x_coords), max(y_coords)
-                    pad = 4
-                    x1 = max(0, x1 - pad)
-                    y1 = max(0, y1 - pad)
-                    x2 = min(image_bgr.shape[1], x2 + pad)
-                    y2 = min(image_bgr.shape[0], y2 + pad)
-                    crop = image_bgr[y1:y2, x1:x2]
-                    items.append((txt, conf, crop))
-                except Exception:
+    if not isinstance(result, list):
+        return items
+    for page in result:
+        if not isinstance(page, list):
+            continue
+        for det in page:
+            try:
+                if not isinstance(det, list) or len(det) != 2:
                     continue
+                box, txt_conf = det
+                if not (isinstance(txt_conf, (list, tuple)) and len(txt_conf) >= 2):
+                    continue
+                txt = str(txt_conf[0])
+                conf = float(txt_conf[1]) if txt_conf[1] is not None else 0.0
+                xs = [int(p[0]) for p in box]
+                ys = [int(p[1]) for p in box]
+                x1, x2 = max(min(xs), 0), min(max(xs), image_bgr.shape[1])
+                y1, y2 = max(min(ys), 0), min(max(ys), image_bgr.shape[0])
+                crop = image_bgr[y1:y2, x1:x2]
+                items.append((txt, conf, crop, box))
+            except Exception:
+                continue
     return items
 
 
@@ -289,11 +288,130 @@ ANCHORS = {
     "dob": ["ngày sinh", "ngay sinh", "date of birth", "birth"],
     "gender": ["giới tính", "gioi tinh", "sex"],
     "nationality": ["quốc tịch", "quoc tich", "nationality"],
-    "origin": ["quê quán", "que quan", "place of origin", "origin"],
-    "residence": ["nơi thường trú", "noi thuong tru", "place of residence", "residence", "residen"],
+    "origin": ["quê quán", "que quan", "place of origin", "origin", "place of", "origin:"],
+    "residence": ["nơi thường trú", "noi thuong tru", "place of residence", "residence", "residen", "place of"],
     "expiry": ["có giá trị đến", "co gia tri den", "valid until", "good thru", "valid thru", "date of expiry"],
-    "issue": [],
+    "issue": ["ngày cấp", "ngay cap", "issued on", "issue date", "issued by", "nơi cấp", "noi cap"],
 }
+
+def _norm_no_accents(s: str) -> str:
+    s = unicodedata.normalize('NFD', s)
+    s = ''.join(ch for ch in s if unicodedata.category(ch) != 'Mn')
+    s = s.lower()
+    return re.sub(r"\s+", " ", s).strip()
+
+def _is_anchor(text: str, anchors: List[str]) -> bool:
+    t = _norm_no_accents(text)
+    for a in anchors:
+        if _norm_no_accents(a) in t:
+            return True
+    return False
+
+def _find_anchor_box(items, anchors: List[str], alt_tokens: List[str]) -> Optional[List[List[int]]]:
+    """Tìm box nhãn: ưu tiên khớp full anchor; nếu không, khớp theo từ khoá rời (alt_tokens)."""
+    candidates = []
+    for txt, conf, crop, box in items:
+        if _is_anchor(txt, anchors):
+            candidates.append(box)
+    if candidates:
+        candidates.sort(key=lambda b: _box_to_rect(b)[0])
+        return candidates[0]
+    # fallback: tìm theo token rời
+    for txt, conf, crop, box in items:
+        nt = _norm_no_accents(txt)
+        if any(tok in nt for tok in alt_tokens):
+            candidates.append(box)
+    if candidates:
+        candidates.sort(key=lambda b: _box_to_rect(b)[0])
+        return candidates[0]
+    return None
+
+def _box_to_rect(box: List[List[int]]) -> Tuple[int, int, int, int]:
+    xs = [int(p[0]) for p in box]
+    ys = [int(p[1]) for p in box]
+    return min(xs), min(ys), max(xs), max(ys)
+
+def _group_lines(items) -> List[Tuple[str, List[Tuple[int,int,int,int]]]]:
+    """Nhóm các box theo dòng (dựa trên tâm y) và ghép text theo thứ tự x.
+    Trả về [(line_text, [rects...])]."""
+    lines: List[List[Tuple[int,int,int,int,str]]] = []
+    for txt, conf, crop, box in items:
+        x1, y1, x2, y2 = _box_to_rect(box)
+        my = (y1 + y2) // 2
+        placed = False
+        for line in lines:
+            # so sánh với tâm dòng đầu tiên
+            lx1, ly1, lx2, ly2, _ = line[0]
+            lmy = (ly1 + ly2) // 2
+            if abs(my - lmy) <= max(8, (ly2 - ly1) // 2 + 10):
+                line.append((x1, y1, x2, y2, txt))
+                placed = True
+                break
+        if not placed:
+            lines.append([(x1, y1, x2, y2, txt)])
+    merged: List[Tuple[str, List[Tuple[int,int,int,int]]]] = []
+    for line in lines:
+        line.sort(key=lambda t: t[0])
+        text = " ".join([t[4] for t in line])
+        rects = [(t[0], t[1], t[2], t[3]) for t in line]
+        merged.append((_normalize(text), rects))
+    return merged
+
+def _read_right_of_anchor(image_bgr, ocr: PaddleOCR, items, anchors: List[str], max_gap_px: int = 12, right_pad: int = 40) -> str:
+    """Tìm box là anchor rồi đọc vùng bên phải trên cùng hàng, OCR ROI theo multipass."""
+    H, W = image_bgr.shape[:2]
+    # alt token heuristics cho name/origin/residence
+    alt_map = {
+        'name': ['full', 'name', 'ho', 'ten'],
+        'origin': ['place', 'origin', 'que', 'quan'],
+        'residence': ['place', 'residen', 'residence', 'noi', 'thuong', 'tru'],
+    }
+    key = 'name' if 'full name' in ' '.join(anchors) or 'ho va ten' in ' '.join(anchors) else (
+        'origin' if 'origin' in ' '.join(anchors) or 'que quan' in ' '.join(anchors) else 'residence'
+    )
+    anchor_box = _find_anchor_box(items, anchors, alt_map.get(key, []))
+    if anchor_box is None:
+        # Thử ghép theo dòng rồi tìm anchor trên toàn dòng
+        for line_text, rects in _group_lines(items):
+            if _is_anchor(line_text, anchors) or any(tok in _norm_no_accents(line_text) for tok in alt_map.get(key, [])):
+                # lấy union rect của các rects thuộc dòng
+                xs1 = [r[0] for r in rects]; ys1 = [r[1] for r in rects]
+                xs2 = [r[2] for r in rects]; ys2 = [r[3] for r in rects]
+                ax1, ay1, ax2, ay2 = min(xs1), min(ys1), max(xs2), max(ys2)
+                anchor_box = [[ax1, ay1], [ax2, ay1], [ax2, ay2], [ax1, ay2]]
+                break
+        if anchor_box is None:
+            _dbg('no_anchor_found_for', anchors[:2])
+            return ""
+    ax1, ay1, ax2, ay2 = _box_to_rect(anchor_box)
+    mid_y = (ay1 + ay2) // 2
+    line_boxes: List[Tuple[int, int, int, int]] = []
+    for txt, conf, crop, box in items:
+        x1, y1, x2, y2 = _box_to_rect(box)
+        if x1 <= ax2:
+            continue
+        my = (y1 + y2) // 2
+        if abs(my - mid_y) <= max(8, (ay2 - ay1) // 2 + max_gap_px):
+            line_boxes.append((x1, y1, x2, y2))
+    if not line_boxes:
+        rx1 = min(ax2 + 2, W - 1)
+        rx2 = min(W - 1, ax2 + W // 2 + right_pad)
+        ry1 = max(ay1 - 8, 0)
+        ry2 = min(ay2 + 8, H)
+        roi = image_bgr[ry1:ry2, rx1:rx2]
+    else:
+        xs1 = [b[0] for b in line_boxes]
+        ys1 = [b[1] for b in line_boxes]
+        xs2 = [b[2] for b in line_boxes]
+        ys2 = [b[3] for b in line_boxes]
+        rx1 = min(xs1)
+        ry1 = max(0, min(ys1) - 2)
+        rx2 = min(W - 1, max(xs2) + right_pad)
+        ry2 = min(H, max(ys2) + 2)
+        roi = image_bgr[ry1:ry2, rx1:rx2]
+    text, conf, lines = _ocr_multipass_text(ocr, roi)
+    _dbg('roi_text', text)
+    return _normalize(text)
 
 
 def extract_id_fields(image_bgr) -> Dict:
@@ -305,6 +423,7 @@ def extract_id_fields(image_bgr) -> Dict:
     }
     """
     ocr = get_ocr_instance()
+    # Pass 1: full text phục vụ số/ngày; Pass 2: đọc theo anchor + bbox cho field dài
     full, avg_conf, lines = _ocr_multipass_text(ocr, image_bgr)
     out = {}
     
@@ -344,7 +463,17 @@ def extract_id_fields(image_bgr) -> Dict:
     if re.search(r"Vi[eê]t\s*Nam", full, re.I):
         out["nationality"] = "Việt Nam"
     
-    # Họ tên / Name: dùng anchors dòng để lấy phần sau nhãn đến trước "Ngày sinh"
+    # Họ tên / Name: ƯU TIÊN đọc theo anchor + bbox
+    items = _ocr_collect_with_crops(ocr, image_bgr)
+    name_roi = _read_right_of_anchor(image_bgr, ocr, items, ANCHORS["name"])
+    if name_roi:
+        name_clean = re.sub(r"(?i)(^i\s+)?(^ho\s*va\s*ten|^họ\s*và\s*tên|^full\s*name)[\s:：\-|/]*", "", name_roi)
+        name_clean = re.sub(r"[^A-Za-zÀ-ỹ\s]", " ", name_clean)
+        name_clean = re.sub(r"\s+", " ", name_clean).strip()
+        if name_clean:
+            out["name"] = name_clean
+
+    # Nếu chưa có name, fallback text-based (giữ nguyên logic cũ)
     def _normalize_line(s: str) -> str:
         return _normalize(unicodedata.normalize("NFC", s)).lower()
 
@@ -414,47 +543,42 @@ def extract_id_fields(image_bgr) -> Dict:
         name = re.sub(r"\s+", " ", name).strip()
         out["name"] = name
     
-    # Quê quán (Place of origin): lấy từ anchors đến trước "Nơi thường trú"
-    origin = collect_after(
-        anchors=ANCHORS["origin"],
-        stop_keywords=ANCHORS["residence"] + ANCHORS["expiry"] + ANCHORS["issue"],
-        max_lines=2,
-    )
-    if origin:
-        origin_clean = _remove_anchors(origin, ANCHORS["origin"]) 
-        # Cắt cứng khi gặp dấu phân tách + nhãn kế tiếp (bao gồm bản thiếu chữ/không dấu)
-        ascii_o = _strip_accents(origin_clean).lower()
-        cut_candidates = [
-            "/ place of residen", "/ place of residence", "| place of residen", "| place of residence",
-            " place of residen", " place of residence", " noi thuong", " noi ",
-        ]
-        cut_pos = None
-        for tok in cut_candidates:
-            pos = ascii_o.find(tok)
-            if pos != -1:
-                cut_pos = pos if cut_pos is None else min(cut_pos, pos)
-        if cut_pos is not None:
-            origin_clean = origin_clean[:cut_pos]
-        # Cắt mềm theo danh sách nhãn dừng
-        origin_clean = _cut_before_next_label(origin_clean, ANCHORS["residence"] + ANCHORS["expiry"] + ANCHORS["issue"]) 
-        out["place_of_origin"] = origin_clean
+    # Quê quán (Place of origin): ưu tiên anchor+bbox
+    origin_roi = _read_right_of_anchor(image_bgr, ocr, items, ANCHORS["origin"])
+    if origin_roi:
+        # loại phần nhãn tiếng Anh còn sót
+        origin_roi = re.sub(r"(?i)place\s*of\s*origin\s*[:：-]*", "", origin_roi)
+        out["place_of_origin"] = _normalize(origin_roi)
+    if not out.get("place_of_origin"):
+        # fallback text-based
+        origin = collect_after(
+            anchors=ANCHORS["origin"],
+            stop_keywords=ANCHORS["residence"] + ANCHORS["expiry"] + ANCHORS["issue"],
+            max_lines=2,
+        )
+        if origin:
+            origin_clean = _remove_anchors(origin, ANCHORS["origin"]) 
+            origin_clean = _cut_before_next_label(origin_clean, ANCHORS["residence"] + ANCHORS["expiry"] + ANCHORS["issue"]) 
+            out["place_of_origin"] = origin_clean
     # Nơi thường trú (Place of residence)
-    residence = collect_after(
-        anchors=ANCHORS["residence"],
-        stop_keywords=ANCHORS["expiry"] + ANCHORS["issue"] + ANCHORS["gender"],
-        max_lines=3,
-    )
-    if residence:
-        residence = _remove_anchors(residence, ANCHORS["residence"]) 
-        # Nếu còn dính "Place of residen..." ở cuối, cắt bỏ
-        ascii_r = _strip_accents(residence).lower()
-        for tok in ["/ place of residen", "| place of residen", " place of residen", " place of residence"]:
-            pos = ascii_r.find(tok)
-            if pos != -1:
-                residence = residence[:pos]
-                break
-        residence = _cut_before_next_label(residence, ANCHORS["expiry"] + ANCHORS["issue"]) 
-        out["residence"] = residence
+    # Nơi thường trú: ưu tiên anchor+bbox
+    residence_roi = _read_right_of_anchor(image_bgr, ocr, items, ANCHORS["residence"]) 
+    if residence_roi:
+        # loại ngày tháng nếu OCR lẫn vào
+        residence_roi = re.sub(r"\b\d{2}[\/-]\d{2}[\/-]\d{4}.*$", "", residence_roi).strip()
+        residence_roi = re.sub(r"(?i)place\s*of\s*residen[ce]\s*[:：-]*", "", residence_roi)
+        out["residence"] = _normalize(residence_roi)
+    if not out.get("residence"):
+        # fallback text-based
+        residence = collect_after(
+            anchors=ANCHORS["residence"],
+            stop_keywords=ANCHORS["expiry"] + ANCHORS["issue"] + ANCHORS["gender"],
+            max_lines=3,
+        )
+        if residence:
+            residence = _remove_anchors(residence, ANCHORS["residence"]) 
+            residence = _cut_before_next_label(residence, ANCHORS["expiry"] + ANCHORS["issue"]) 
+            out["residence"] = residence
     # Fallback mạnh từ full text nếu vẫn chưa có
     if not out.get("residence"):
         res2 = _slice_between(full, start_keywords=ANCHORS["residence"], stop_keywords=ANCHORS["expiry"] + ANCHORS["issue"]) 
@@ -467,6 +591,22 @@ def extract_id_fields(image_bgr) -> Dict:
         m = re.search(r"Địa\s*chỉ[: ]+(.+?)(?:Ngày\s*cấp|$)", full, re.I | re.DOTALL)
         if m:
             out["residence"] = _normalize(m.group(1))
+
+    # Ngày cấp + Nơi cấp (ưu tiên theo anchor-box "issue")
+    issue_roi = _read_right_of_anchor(image_bgr, ocr, items, ANCHORS["issue"])
+    if issue_roi:
+        # Tách ngày trong chuỗi issue
+        m2 = re.search(r"\b(0?[1-9]|[12]\d|3[01])[\/\-](0?[1-9]|1[0-2])[\/\-]((?:19|20)\d{2})\b", issue_roi)
+        if m2:
+            out["issue_date"] = f"{m2.group(1).zfill(2)}/{m2.group(2).zfill(2)}/{m2.group(3)}"
+            issue_rest = issue_roi.replace(m2.group(0), " ").strip()
+        else:
+            issue_rest = issue_roi
+        # Loại nhãn
+        issue_rest = re.sub(r"(?i)(ngay\s*cap|ngày\s*cấp|issued\s*on|issue\s*date|issued\s*by|noi\s*cap|nơi\s*cấp)[:：\-|/]*", "", issue_rest)
+        issue_rest = re.sub(r"\s+", " ", issue_rest).strip()
+        if issue_rest:
+            out["issuer"] = issue_rest
 
     # Refine bằng VietOCR nếu có cho các trường dài
     viet = get_vietocr_instance()
@@ -543,11 +683,12 @@ def extract_id_fields(image_bgr) -> Dict:
         r"Nơi\s*cấp[: ]+(.+?)(?:$)",
         r"Cơ\s*quan\s*cấp[: ]+(.+?)(?:$)",
     ]
-    for pattern in issuer_patterns:
-        m = re.search(pattern, full, re.I | re.DOTALL)
-        if m:
-            out["issuer"] = _normalize(m.group(1))
-            break
+    if not out.get("issuer"):
+        for pattern in issuer_patterns:
+            m = re.search(pattern, full, re.I | re.DOTALL)
+            if m:
+                out["issuer"] = _normalize(m.group(1))
+                break
     
     return out
 
