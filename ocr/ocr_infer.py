@@ -283,6 +283,18 @@ def _slice_between(raw_text: str, start_keywords: List[str], stop_keywords: List
         sub = sub[:end_idx]
     return _normalize(sub)
 
+# Anchor sets for labels (Vietnamese, English, no-accent, common OCR variants)
+ANCHORS = {
+    "name": ["họ và tên", "ho va ten", "full name", "ho và tên", "full-name"],
+    "dob": ["ngày sinh", "ngay sinh", "date of birth", "birth"],
+    "gender": ["giới tính", "gioi tinh", "sex"],
+    "nationality": ["quốc tịch", "quoc tich", "nationality"],
+    "origin": ["quê quán", "que quan", "place of origin", "origin"],
+    "residence": ["nơi thường trú", "noi thuong tru", "place of residence", "residence", "residen"],
+    "expiry": ["có giá trị đến", "co gia tri den", "valid until", "good thru", "valid thru", "date of expiry"],
+    "issue": [],
+}
+
 
 def extract_id_fields(image_bgr) -> Dict:
     """
@@ -318,11 +330,6 @@ def extract_id_fields(image_bgr) -> Dict:
                           full, re.I)
         if m_exp:
             out["expiry_date"] = _normalize(m_exp.group(2))
-        # Ngày cấp nếu có nhãn
-        m_issue = re.search(r"Ngày\s*cấp\s*[: ]+((?:0?[1-9]|[12]\d|3[01])[\/\-](?:0?[1-9]|1[0-2])[\/\-](?:19|20)\d{2})",
-                            full, re.I)
-        if m_issue:
-            out["issue_date"] = _normalize(m_issue.group(1))
         # Nếu chưa phân loại mà có >1 date, gán date thứ 2 là expiry_date (CCCD mẫu mới)
         if not out.get("expiry_date") and len(dates) > 1:
             out["expiry_date"] = pack(dates[1])
@@ -365,12 +372,12 @@ def extract_id_fields(image_bgr) -> Dict:
 
     # Heuristic 1: lấy sau nhãn (accent-insensitive), loại tiêu đề nếu dính trên cùng dòng
     name = collect_after(
-        anchors=["họ và tên", "ho va ten", "full name", "ho và tên"],
-        stop_keywords=["ngày sinh", "date of birth", "giới tính", "sex"],
+        anchors=ANCHORS["name"],
+        stop_keywords=ANCHORS["dob"] + ANCHORS["gender"],
         max_lines=2,
     )
     if name:
-        name = _remove_anchors(name, ["họ và tên", "ho va ten", "full name", "ho và tên"]) 
+        name = _remove_anchors(name, ANCHORS["name"]) 
 
     # Heuristic 2: nếu chưa có, tìm dòng HOA nhất giữa số CCCD và "Ngày sinh"
     if not name:
@@ -409,12 +416,12 @@ def extract_id_fields(image_bgr) -> Dict:
     
     # Quê quán (Place of origin): lấy từ anchors đến trước "Nơi thường trú"
     origin = collect_after(
-        anchors=["quê quán", "que quan", "place of origin"],
-        stop_keywords=["nơi thường trú", "noi thuong tru", "place of residence", "có giá trị", "co gia tri", "ngày cấp", "issue date"],
+        anchors=ANCHORS["origin"],
+        stop_keywords=ANCHORS["residence"] + ANCHORS["expiry"] + ANCHORS["issue"],
         max_lines=2,
     )
     if origin:
-        origin_clean = _remove_anchors(origin, ["quê quán", "que quan", "place of origin"]) 
+        origin_clean = _remove_anchors(origin, ANCHORS["origin"]) 
         # Cắt cứng khi gặp dấu phân tách + nhãn kế tiếp (bao gồm bản thiếu chữ/không dấu)
         ascii_o = _strip_accents(origin_clean).lower()
         cut_candidates = [
@@ -429,19 +436,16 @@ def extract_id_fields(image_bgr) -> Dict:
         if cut_pos is not None:
             origin_clean = origin_clean[:cut_pos]
         # Cắt mềm theo danh sách nhãn dừng
-        origin_clean = _cut_before_next_label(origin_clean, [
-            "nơi thường trú", "noi thuong tru", "place of residence", "place of residen",
-            "có giá trị", "co gia tri", "ngày cấp", "issue date",
-        ])
+        origin_clean = _cut_before_next_label(origin_clean, ANCHORS["residence"] + ANCHORS["expiry"] + ANCHORS["issue"]) 
         out["place_of_origin"] = origin_clean
     # Nơi thường trú (Place of residence)
     residence = collect_after(
-        anchors=["nơi thường trú", "noi thuong tru", "place of residence"],
-        stop_keywords=["có giá trị", "co gia tri", "valid", "valid until", "ngày cấp", "issue date", "sex", "giới tính"],
+        anchors=ANCHORS["residence"],
+        stop_keywords=ANCHORS["expiry"] + ANCHORS["issue"] + ANCHORS["gender"],
         max_lines=3,
     )
     if residence:
-        residence = _remove_anchors(residence, ["nơi thường trú", "noi thuong tru", "place of residence"]) 
+        residence = _remove_anchors(residence, ANCHORS["residence"]) 
         # Nếu còn dính "Place of residen..." ở cuối, cắt bỏ
         ascii_r = _strip_accents(residence).lower()
         for tok in ["/ place of residen", "| place of residen", " place of residen", " place of residence"]:
@@ -449,17 +453,11 @@ def extract_id_fields(image_bgr) -> Dict:
             if pos != -1:
                 residence = residence[:pos]
                 break
-        residence = _cut_before_next_label(residence, [
-            "có giá trị", "co gia tri", "valid", "valid until", "ngày cấp", "issue date"
-        ])
+        residence = _cut_before_next_label(residence, ANCHORS["expiry"] + ANCHORS["issue"]) 
         out["residence"] = residence
     # Fallback mạnh từ full text nếu vẫn chưa có
     if not out.get("residence"):
-        res2 = _slice_between(
-            full,
-            start_keywords=["nơi thường trú", "noi thuong tru", "place of residence", "place of residen"],
-            stop_keywords=["có giá trị", "co gia tri", "valid", "valid until", "ngày cấp", "issue date"],
-        )
+        res2 = _slice_between(full, start_keywords=ANCHORS["residence"], stop_keywords=ANCHORS["expiry"] + ANCHORS["issue"]) 
         if res2:
             # Loại bỏ bất kỳ ngày/thời gian ở cuối do OCR lẫn
             res2 = re.sub(r"\b\d{2}[\/-]\d{2}[\/-]\d{4}.*$", "", res2).strip()
@@ -517,7 +515,7 @@ def extract_id_fields(image_bgr) -> Dict:
             if not out.get('place_of_origin'):
                 vorig = viet_join_after(
                     anchor_keywords=["que quan", "quê quan", "quê quán", "place of origin"],
-                    stop_keywords=["noi thuong tru", "nơi thuong tru", "nơi thường trú", "place of residence", "co gia tri", "valid", "ngay cap", "issue"],
+                    stop_keywords=["noi thuong tru", "nơi thuong tru", "nơi thường trú", "place of residence", "co gia tri", "valid"],
                     max_lines=2,
                 )
                 if vorig:
@@ -527,7 +525,7 @@ def extract_id_fields(image_bgr) -> Dict:
             if not out.get('residence'):
                 vres = viet_join_after(
                     anchor_keywords=["noi thuong tru", "nơi thuong tru", "nơi thường trú", "place of residence"],
-                    stop_keywords=["co gia tri", "valid", "ngay cap", "issue"],
+                    stop_keywords=["co gia tri", "valid"],
                     max_lines=3,
                 )
                 if vres:

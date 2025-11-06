@@ -115,7 +115,6 @@ class IDCardPhoto(QWidget):
             'nationality': ('Quốc tịch:', 1000, 350),
             'place_of_origin': ('Quê quán:', 1000, 400),
             'residence': ('Nơi thường trú:', 1000, 450),
-            'issue_date': ('Ngày cấp:', 1000, 500),
             'expiry_date': ('Có giá trị đến:', 1000, 550),
         }
         
@@ -222,7 +221,6 @@ class IDCardPhoto(QWidget):
             'nationality': 'nationality',
             'place_of_origin': 'place_of_origin',
             'residence': 'residence',
-            'issue_date': 'issue_date',
             'expiry_date': 'expiry_date',
         }
         
@@ -251,7 +249,6 @@ class IDCardPhoto(QWidget):
             'nationality': 'nationality',
             'place_of_origin': 'place_of_origin',
             'residence': 'residence',
-            'issue_date': 'issue_date',
             'expiry_date': 'expiry_date',
         }
         
