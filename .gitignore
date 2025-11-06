@@ -6,3 +6,5 @@ images/
 landmarks/
 results/
 *.ipynb
+tests/test1.jpg
+tests/test2.jpg
