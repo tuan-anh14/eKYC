@@ -40,6 +40,9 @@ class MainWindow(QMainWindow):
 
         # camera
         self.camera = cv.VideoCapture(0)
+        
+        # OCR fields (được lưu từ page1)
+        self.ocr_fields = {}
 
         # stack widget
         self.stacked_widget = QStackedWidget()

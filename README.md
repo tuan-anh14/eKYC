@@ -16,9 +16,23 @@ This README provides an overview of the eKYC (Electronic Know Your Customer) flo
 
 ![](resources/flow.jpg)
 
-#### 1. Upload Document (ID Card)
+#### 1. Upload Document (ID Card) & OCR Extraction
 
-Initially, users are required to upload an image of their ID card. This step is essential for extracting facial information from the ID card photo.
+Initially, users are required to upload an image of their ID card. The system will automatically extract information from the ID card using OCR (Optical Character Recognition) technology:
+
+- **OCR Technology**: The system uses PaddleOCR to extract text from Vietnamese ID cards (CCCD)
+- **Extracted Fields**: 
+  - Số CCCD (ID Number)
+  - Họ và tên (Full Name)
+  - Ngày sinh (Date of Birth)
+  - Giới tính (Gender)
+  - Quốc tịch (Nationality)
+  - Địa chỉ (Address)
+  - Ngày cấp (Issue Date)
+  - Nơi cấp (Issuing Authority)
+- **Manual Editing**: Users can manually edit any OCR results if there are recognition errors
+- **Validation**: The system validates that essential fields (ID number and date of birth) are present before proceeding
+- **Data Export**: OCR results are automatically saved to JSON files in the `results/` directory
 
 #### 2. Face Verification
 
@@ -46,16 +60,49 @@ cd eKYC
 ```
 2. Install the required dependencies
 ```bash
+# Nâng cấp pip và wheel trước
+python -m pip install --upgrade pip wheel
+
+# Cài đặt dependencies
 pip install -r requirements.txt
 ```
 
-## Usage
-1. Download weights of the [pretrained VGGFace models](https://drive.google.com/drive/folders/1-pEMok04-UqpeCi_yscUcIA6ytvxhvkG?usp=drive_link) from ggdrive, and then add them to the 'verification_models/weights' directory. Download weights and landmarks of the [pretrained liveness detection models](https://drive.google.com/drive/folders/1S6zLU8_Cgode7B7mfJWs9oforfAODaGB?usp=drive_link) from ggdrive, and then add them to the 'liveness_detection/landmarks' directory
+**Note**: The OCR functionality requires PaddleOCR and PaddlePaddle. On Windows (AMD64), PaddlePaddle 2.5.2 will be automatically installed. For other platforms, you may need to adjust the requirements.
 
-2. Using the PyQt5 Interface:
+## Usage
+
+### 1. Download Model Weights
+Download weights of the [pretrained VGGFace models](https://drive.google.com/drive/folders/1-pEMok04-UqpeCi_yscUcIA6ytvxhvkG?usp=drive_link) from ggdrive, and then add them to the 'verification_models/weights' directory. Download weights and landmarks of the [pretrained liveness detection models](https://drive.google.com/drive/folders/1S6zLU8_Cgode7B7mfJWs9oforfAODaGB?usp=drive_link) from ggdrive, and then add them to the 'liveness_detection/landmarks' directory.
+
+### 2. Run eKYC Application (GUI)
+Chạy ứng dụng eKYC với giao diện PyQt5:
 ```bash
-python3 main.py
+python main.py
 ```
+
+**Hướng dẫn sử dụng OCR trong GUI:**
+1. Trên trang đầu tiên, nhấn nút **"Chọn ảnh CCCD"** để chọn ảnh thẻ căn cước
+2. Nhấn nút **"Trích xuất thông tin"** để chạy OCR và tự động trích xuất thông tin từ ảnh
+3. Kiểm tra và chỉnh sửa các thông tin được trích xuất nếu cần (các trường có thể chỉnh sửa: Số CCCD, Họ tên, Ngày sinh, Giới tính, Quốc tịch, Địa chỉ, Ngày cấp, Nơi cấp)
+4. Nhấn **"Next"** để tiếp tục sang bước xác thực khuôn mặt
+5. Kết quả OCR sẽ tự động được lưu vào thư mục `results/` dưới dạng file JSON
+
+### 3. Test OCR Module (Command Line)
+Test OCR module độc lập từ command line:
+```bash
+# Cách 1: Sử dụng script test
+python tests/ocr_test.py --image <đường_dẫn_ảnh_CCCD>
+
+# Cách 2: Sử dụng module trực tiếp
+python -m ocr.ocr_infer --image <đường_dẫn_ảnh_CCCD>
+```
+
+**Ví dụ:**
+```bash
+python tests/ocr_test.py --image path/to/cccd_image.jpg
+```
+
+Kết quả sẽ hiển thị các thông tin được trích xuất dưới dạng JSON.
 
 ## Results
 
