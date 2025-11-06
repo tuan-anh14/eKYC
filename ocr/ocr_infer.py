@@ -6,7 +6,7 @@ import re
 import unicodedata
 from typing import Dict, Optional, Tuple, List
 import os
-from .preprocess import preprocess_for_ocr, resize_keep_aspect
+from .preprocess import preprocess_for_ocr, preprocess_for_ocr_v2, preprocess_for_ocr_v3, resize_keep_aspect
 
 # Khởi tạo OCR model một lần (singleton pattern)
 _ocr_instance = None
@@ -23,8 +23,8 @@ def get_ocr_instance():
 def get_vietocr_instance():
     """Lazy init VietOCR; trả về None nếu gói chưa được cài."""
     global _vietocr_instance
-    # Mặc định KHÔNG bật VietOCR để nhẹ; chỉ bật khi USE_VIETOCR=1
-    if os.environ.get('USE_VIETOCR', '0') != '1':
+    # Mặc định cố gắng bật VietOCR nếu có; có thể tắt bằng USE_VIETOCR=0
+    if os.environ.get('USE_VIETOCR', '1') == '0':
         return None
     if _vietocr_instance is not None:
         return _vietocr_instance
@@ -181,28 +181,58 @@ def _ocr_collect_with_crops(ocr: PaddleOCR, image_bgr) -> List[Tuple[str, float,
     return items
 
 
-def _ocr_multipass_text(ocr: PaddleOCR, image_bgr) -> Tuple[str, float, List[str]]:
-    """Chạy OCR nhiều pass (resize + preprocess) và chọn kết quả có avg confidence cao nhất.
+def _count_vietnamese_chars(text: str) -> int:
+    """Đếm số ký tự tiếng Việt có dấu trong text"""
+    if not text:
+        return 0
+    count = 0
+    for char in text:
+        # Ký tự tiếng Việt có dấu: U+00C0 đến U+1EF9
+        if ord(char) >= 0x00C0 and ord(char) <= 0x1EF9:
+            count += 1
+    return count
+
+def _ocr_multipass_text(ocr: PaddleOCR, image_bgr, fast_mode: bool = False) -> Tuple[str, float, List[str]]:
+    """Chạy OCR nhiều pass (resize + preprocess) và chọn kết quả tốt nhất.
+    Ưu tiên kết quả có nhiều ký tự tiếng Việt có dấu và confidence cao.
     Trả về: (full_text, avg_conf, lines)
+    
+    Args:
+        fast_mode: Nếu True, chỉ chạy 1 pass (resize) để tăng tốc
     """
-    candidates: List[Tuple[str, float, List[str]]] = []
-    # Pass 1: resize mềm để tăng chiều cao chữ
+    candidates: List[Tuple[str, float, List[str], int]] = []  # (text, conf, lines, viet_count)
+    
+    # Pass 1: resize mềm để tăng chiều cao chữ (pass này thường tốt nhất cho tiếng Việt)
     img1 = resize_keep_aspect(image_bgr, height=256)
     lines1, confs1 = _ocr_collect_lines(ocr, img1)
     if lines1:
+        text1 = " ".join(lines1)
         avg1 = sum(confs1) / max(1, len(confs1))
-        candidates.append((" ".join(lines1), avg1, lines1))
+        viet_count1 = _count_vietnamese_chars(text1)
+        candidates.append((text1, avg1, lines1, viet_count1))
+    
+    # Nếu fast_mode, chỉ chạy 1 pass
+    if fast_mode:
+        if candidates:
+            best_text, best_conf, best_lines, _ = candidates[0]
+            return _normalize(best_text), float(best_conf), best_lines
+        return "", 0.0, []
+    
     # Pass 2: tiền xử lý mạnh (CLAHE + denoise + sharpen + adaptive threshold)
     img2 = preprocess_for_ocr(image_bgr)
     lines2, confs2 = _ocr_collect_lines(ocr, img2)
     if lines2:
+        text2 = " ".join(lines2)
         avg2 = sum(confs2) / max(1, len(confs2))
-        candidates.append((" ".join(lines2), avg2, lines2))
+        viet_count2 = _count_vietnamese_chars(text2)
+        candidates.append((text2, avg2, lines2, viet_count2))
 
     if not candidates:
         return "", 0.0, []
-    # Chọn theo avg confidence
-    best_text, best_conf, best_lines = max(candidates, key=lambda x: x[1])
+    
+    # Chọn kết quả tốt nhất: ưu tiên có nhiều ký tự tiếng Việt có dấu, sau đó mới xét confidence
+    # Score = viet_count * 0.7 + confidence * 0.3 (ưu tiên cao hơn cho ký tự tiếng Việt)
+    best_text, best_conf, best_lines, _ = max(candidates, key=lambda x: (x[3] * 0.7 + x[1] * 0.3))
     return _normalize(best_text), float(best_conf), best_lines
 
 
@@ -357,8 +387,27 @@ def _group_lines(items) -> List[Tuple[str, List[Tuple[int,int,int,int]]]]:
         merged.append((_normalize(text), rects))
     return merged
 
-def _read_right_of_anchor(image_bgr, ocr: PaddleOCR, items, anchors: List[str], max_gap_px: int = 12, right_pad: int = 40) -> str:
-    """Tìm box là anchor rồi đọc vùng bên phải trên cùng hàng, OCR ROI theo multipass."""
+def _is_date_pattern(text: str) -> bool:
+    """Kiểm tra xem text có phải là pattern ngày tháng không (dd/mm/yyyy, dd-mm-yyyy, dd mm yyyy)"""
+    if not text:
+        return False
+    # Pattern: 2 số, separator (/, -, space), 2 số, separator, 4 số
+    patterns = [
+        r'\b\d{1,2}[\/\- ]\d{1,2}[\/\- ]\d{4}\b',  # dd/mm/yyyy, dd-mm-yyyy, dd mm yyyy
+        r'\b\d{1,2}\s+\d{1,2}\s+\d{4}\b',  # dd mm yyyy với nhiều space
+    ]
+    for pattern in patterns:
+        if re.search(pattern, text):
+            return True
+    return False
+
+def _read_right_of_anchor(image_bgr, ocr: PaddleOCR, items, anchors: List[str], max_gap_px: int = 12, right_pad: int = 40, max_lines: int = 1, stop_at_date: bool = False, stop_after_anchors: Optional[List[str]] = None) -> str:
+    """Tìm box là anchor rồi đọc vùng bên phải trên cùng hàng và các dòng tiếp theo, OCR ROI theo multipass.
+    
+    Args:
+        max_lines: Số dòng tối đa để đọc (1 = chỉ dòng hiện tại, >1 = đọc thêm các dòng dưới)
+        stop_at_date: Nếu True, dừng khi gặp pattern ngày tháng (dùng cho residence để tránh lấy ngày)
+    """
     H, W = image_bgr.shape[:2]
     # alt token heuristics cho name/origin/residence
     alt_map = {
@@ -385,19 +434,123 @@ def _read_right_of_anchor(image_bgr, ocr: PaddleOCR, items, anchors: List[str], 
             return ""
     ax1, ay1, ax2, ay2 = _box_to_rect(anchor_box)
     mid_y = (ay1 + ay2) // 2
+    line_height = ay2 - ay1
+    
+    # Thu thập các box trên cùng dòng và các dòng tiếp theo
     line_boxes: List[Tuple[int, int, int, int]] = []
+    all_candidate_boxes = []
+    
+    # Tìm box chứa ngày tháng để dừng lại (nếu stop_at_date=True)
+    date_box_y = None
+    if stop_at_date:
+        for txt, conf, crop, box in items:
+            if _is_date_pattern(txt):
+                x1, y1, x2, y2 = _box_to_rect(box)
+                date_box_y = (y1 + y2) // 2
+                _dbg('found_date_box', txt, date_box_y)
+                break
+
+    # Nếu có stop_after_anchors (ví dụ: "Có giá trị đến"), dừng trước nhãn đó
+    stop_anchor_y = None
+    if stop_after_anchors:
+        stop_box = _find_anchor_box(items, stop_after_anchors, [])
+        if stop_box is not None:
+            sx1, sy1, sx2, sy2 = _box_to_rect(stop_box)
+            stop_anchor_y = sy1
+    
     for txt, conf, crop, box in items:
         x1, y1, x2, y2 = _box_to_rect(box)
         if x1 <= ax2:
             continue
         my = (y1 + y2) // 2
-        if abs(my - mid_y) <= max(8, (ay2 - ay1) // 2 + max_gap_px):
-            line_boxes.append((x1, y1, x2, y2))
+        
+        # Nếu có date_box_y hoặc stop_anchor_y và box này nằm sau mốc dừng, bỏ qua
+        stop_y = None
+        if date_box_y is not None:
+            stop_y = date_box_y - line_height * 0.3
+        if stop_anchor_y is not None:
+            stop_y = min(stop_y, stop_anchor_y) if stop_y is not None else stop_anchor_y
+        if stop_y is not None and my >= stop_y:
+            _dbg('skipping_box_after_stop', txt)
+            continue
+        
+        # Tính khoảng cách theo chiều dọc từ anchor
+        vertical_dist = abs(my - mid_y)
+        # Tăng threshold để lấy được nhiều dòng hơn
+        line_threshold = max(12, line_height // 2 + max_gap_px * 2)
+        
+        # Nếu max_lines > 1, thu thập cả các dòng dưới
+        if max_lines > 1:
+            # Cho phép các box trên cùng dòng hoặc các dòng tiếp theo
+            # Tăng threshold để lấy được nhiều dòng hơn
+            max_vertical_dist = line_threshold * max_lines * 1.5  # Tăng 1.5x để lấy đủ dòng
+            if vertical_dist <= max_vertical_dist:
+                all_candidate_boxes.append((x1, y1, x2, y2, my, txt))
+        else:
+            # Chỉ lấy box trên cùng dòng
+            if vertical_dist <= line_threshold:
+                line_boxes.append((x1, y1, x2, y2))
+    
+    # Nếu có nhiều dòng, sắp xếp theo y và nhóm lại
+    if max_lines > 1 and all_candidate_boxes:
+        # Sắp xếp theo y
+        all_candidate_boxes.sort(key=lambda b: b[4])
+        # Nhóm thành các dòng
+        lines_groups = []
+        current_line = [all_candidate_boxes[0]]
+        current_y = all_candidate_boxes[0][4]
+        
+        for box in all_candidate_boxes[1:]:
+            # Kiểm tra nếu box này chứa ngày tháng, dừng lại
+            if stop_at_date and _is_date_pattern(box[5]):
+                _dbg('stopping_at_date_in_line', box[5])
+                break
+            if abs(box[4] - current_y) <= line_height * 0.8:
+                current_line.append(box)
+            else:
+                lines_groups.append(current_line)
+                current_line = [box]
+                current_y = box[4]
+        if current_line:
+            lines_groups.append(current_line)
+        
+        # Lấy tối đa max_lines dòng đầu tiên, nhưng ưu tiên lấy đủ các dòng trước khi dừng
+        # Nếu có stop_anchor_y, lấy tất cả các dòng trước đó
+        lines_to_take = max_lines
+        if stop_after_anchors and stop_anchor_y is not None:
+            # Đếm số dòng nằm trước stop_anchor_y
+            lines_before_stop = 0
+            for line_group in lines_groups:
+                # Kiểm tra y của dòng đầu tiên trong group
+                if line_group and line_group[0][4] < stop_anchor_y:
+                    lines_before_stop += 1
+                else:
+                    break
+            if lines_before_stop > 0:
+                lines_to_take = min(max_lines, lines_before_stop + 1)  # +1 để chắc chắn
+        
+        for line_group in lines_groups[:lines_to_take]:
+            for x1, y1, x2, y2, _, _ in line_group:
+                line_boxes.append((x1, y1, x2, y2))
+    
     if not line_boxes:
+        # Fallback: tạo ROI từ anchor
         rx1 = min(ax2 + 2, W - 1)
         rx2 = min(W - 1, ax2 + W // 2 + right_pad)
         ry1 = max(ay1 - 8, 0)
-        ry2 = min(ay2 + 8, H)
+        # Mở rộng xuống dưới nếu cần đọc nhiều dòng, nhưng dừng trước mốc dừng nếu có
+        if max_lines > 1:
+            stop_y2 = None
+            if date_box_y is not None:
+                stop_y2 = date_box_y - line_height // 2
+            if stop_anchor_y is not None:
+                stop_y2 = min(stop_y2, stop_anchor_y) if stop_y2 is not None else stop_anchor_y
+            if stop_y2 is not None:
+                ry2 = min(H, stop_y2)
+            else:
+                ry2 = min(H, ay2 + line_height * max_lines + 8)
+        else:
+            ry2 = min(ay2 + 8, H)
         roi = image_bgr[ry1:ry2, rx1:rx2]
     else:
         xs1 = [b[0] for b in line_boxes]
@@ -407,9 +560,23 @@ def _read_right_of_anchor(image_bgr, ocr: PaddleOCR, items, anchors: List[str], 
         rx1 = min(xs1)
         ry1 = max(0, min(ys1) - 2)
         rx2 = min(W - 1, max(xs2) + right_pad)
-        ry2 = min(H, max(ys2) + 2)
+        # Mở rộng xuống dưới nhưng dừng trước mốc dừng nếu có
+        stop_y2 = None
+        if date_box_y is not None:
+            stop_y2 = date_box_y - line_height // 2
+        if stop_anchor_y is not None:
+            stop_y2 = min(stop_y2, stop_anchor_y) if stop_y2 is not None else stop_anchor_y
+        if stop_y2 is not None:
+            ry2 = min(H, stop_y2)
+        else:
+            ry2 = min(H, max(ys2) + 2)
         roi = image_bgr[ry1:ry2, rx1:rx2]
-    text, conf, lines = _ocr_multipass_text(ocr, roi)
+    
+    # Sử dụng fast_mode cho ROI nhỏ để tăng tốc
+    # Dùng multipass đầy đủ cho ROI lớn hoặc khi cần nhận diện dấu tốt (residence, name)
+    # Với residence (max_lines > 5), luôn dùng multipass đầy đủ để nhận diện dấu tốt
+    use_fast = max_lines <= 2 and roi.shape[0] * roi.shape[1] < 50000 and max_lines < 6
+    text, conf, lines = _ocr_multipass_text(ocr, roi, fast_mode=use_fast)
     _dbg('roi_text', text)
     return _normalize(text)
 
@@ -423,8 +590,8 @@ def extract_id_fields(image_bgr) -> Dict:
     }
     """
     ocr = get_ocr_instance()
-    # Pass 1: full text phục vụ số/ngày; Pass 2: đọc theo anchor + bbox cho field dài
-    full, avg_conf, lines = _ocr_multipass_text(ocr, image_bgr)
+    # Pass 1: full text phục vụ số/ngày (dùng fast_mode để tăng tốc)
+    full, avg_conf, lines = _ocr_multipass_text(ocr, image_bgr, fast_mode=True)
     out = {}
     
     # CCCD 12 số
@@ -463,15 +630,64 @@ def extract_id_fields(image_bgr) -> Dict:
     if re.search(r"Vi[eê]t\s*Nam", full, re.I):
         out["nationality"] = "Việt Nam"
     
-    # Họ tên / Name: ƯU TIÊN đọc theo anchor + bbox
+    # Họ tên / Name: Tìm anchor và đọc trực tiếp ROI với multipass đầy đủ
     items = _ocr_collect_with_crops(ocr, image_bgr)
-    name_roi = _read_right_of_anchor(image_bgr, ocr, items, ANCHORS["name"])
-    if name_roi:
-        name_clean = re.sub(r"(?i)(^i\s+)?(^ho\s*va\s*ten|^họ\s*và\s*tên|^full\s*name)[\s:：\-|/]*", "", name_roi)
-        name_clean = re.sub(r"[^A-Za-zÀ-ỹ\s]", " ", name_clean)
-        name_clean = re.sub(r"\s+", " ", name_clean).strip()
-        if name_clean:
-            out["name"] = name_clean
+    name_anchor_box = _find_anchor_box(items, ANCHORS["name"], ['full', 'name', 'ho', 'ten'])
+    
+    if name_anchor_box:
+        H, W = image_bgr.shape[:2]
+        ax1, ay1, ax2, ay2 = _box_to_rect(name_anchor_box)
+        # Tìm anchor tiếp theo (dob hoặc gender) để biết điểm dừng
+        dob_anchor_box = _find_anchor_box(items, ANCHORS["dob"], ['ngay', 'sinh', 'date', 'birth'])
+        
+        # Tạo ROI từ bên phải của "Họ và tên" đến trước "Ngày sinh"
+        roi_x1 = min(ax2 + 2, W - 1)
+        if dob_anchor_box:
+            dx1, dy1, dx2, dy2 = _box_to_rect(dob_anchor_box)
+            roi_x2 = min(W - 1, dx1 - 5)
+            roi_y2 = min(H, dy1 + 10)
+        else:
+            roi_x2 = min(W - 1, ax2 + W // 2 + 40)
+            roi_y2 = min(H, ay2 + 20)
+        roi_y1 = max(0, ay1 - 8)
+        
+        if roi_x1 < roi_x2 and roi_y1 < roi_y2:
+            name_roi_img = image_bgr[roi_y1:roi_y2, roi_x1:roi_x2]
+            # Đọc với multipass đầy đủ để nhận diện dấu tốt
+            name_text, _, _ = _ocr_multipass_text(ocr, name_roi_img, fast_mode=False)
+            
+            if name_text:
+                # Loại bỏ nhãn
+                name_text = re.sub(r"(?i)(^|\s+)(ho\s*va\s*ten|họ\s*và\s*tên|full\s*name|ful\s*nmne|ful\s*name)[\s:：\-|/]*", " ", name_text)
+                # Loại bỏ các ký tự không phải chữ cái và khoảng trắng, nhưng giữ nguyên dấu tiếng Việt
+                name_text = re.sub(r"[^A-Za-zÀ-ỹ\s]", " ", name_text)
+                # Chuẩn hóa khoảng trắng
+                name_text = re.sub(r"\s+", " ", name_text).strip()
+                # Lọc các từ hợp lệ (có nhiều chữ HOA hoặc có dấu tiếng Việt)
+                if name_text:
+                    words = name_text.split()
+                    valid_words = []
+                    for word in words:
+                        if _uppercase_ratio(word) > 0.5 or any(ord(c) >= 0x00C0 and ord(c) <= 0x1EF9 for c in word):
+                            valid_words.append(word)
+                    if valid_words:
+                        out["name"] = " ".join(valid_words)
+    
+    # Fallback: dùng cách cũ nếu không tìm thấy anchor
+    if not out.get("name"):
+        name_roi = _read_right_of_anchor(image_bgr, ocr, items, ANCHORS["name"], max_lines=1)
+        if name_roi:
+            name_clean = re.sub(r"(?i)(^|\s+)(ho\s*va\s*ten|họ\s*và\s*tên|full\s*name)[\s:：\-|/]*", " ", name_roi)
+            name_clean = re.sub(r"[^A-Za-zÀ-ỹ\s]", " ", name_clean)
+            name_clean = re.sub(r"\s+", " ", name_clean).strip()
+            if name_clean:
+                words = name_clean.split()
+                valid_words = []
+                for word in words:
+                    if _uppercase_ratio(word) > 0.5 or any(ord(c) >= 0x00C0 and ord(c) <= 0x1EF9 for c in word):
+                        valid_words.append(word)
+                if valid_words:
+                    out["name"] = " ".join(valid_words)
 
     # Nếu chưa có name, fallback text-based (giữ nguyên logic cũ)
     def _normalize_line(s: str) -> str:
@@ -536,61 +752,152 @@ def extract_id_fields(image_bgr) -> Dict:
         if best:
             name = best
 
-    if name:
+    if name and not out.get("name"):
         # Chỉ giữ chữ cái Latin có dấu và khoảng trắng; chuẩn hoá khoảng trắng
-        name = re.sub(r"(?i)(^ho\s*va\s*ten|^họ\s*và\s*tên|^full\s*name)[\s:：\-|/]*", "", name)
+        name = re.sub(r"(?i)(^|\s+)(ho\s*va\s*ten|họ\s*và\s*tên|full\s*name|ful\s*nmne|ful\s*name)[\s:：\-|/]*", " ", name)
         name = re.sub(r"[^A-Za-zÀ-ỹ\s]", " ", name)
         name = re.sub(r"\s+", " ", name).strip()
-        out["name"] = name
+        # Lọc các từ hợp lệ (có nhiều chữ HOA hoặc có dấu tiếng Việt)
+        if name:
+            words = name.split()
+            valid_words = []
+            for word in words:
+                if _uppercase_ratio(word) > 0.5 or any(ord(c) >= 0x00C0 and ord(c) <= 0x1EF9 for c in word):
+                    valid_words.append(word)
+            if valid_words:
+                out["name"] = " ".join(valid_words)
     
     # Quê quán (Place of origin): ưu tiên anchor+bbox
-    origin_roi = _read_right_of_anchor(image_bgr, ocr, items, ANCHORS["origin"])
+    origin_roi = _read_right_of_anchor(image_bgr, ocr, items, ANCHORS["origin"], max_lines=2)
     if origin_roi:
-        # loại phần nhãn tiếng Anh còn sót
-        origin_roi = re.sub(r"(?i)place\s*of\s*origin\s*[:：-]*", "", origin_roi)
+        # loại phần nhãn tiếng Anh và tiếng Việt còn sót
+        origin_roi = re.sub(r"(?i)(^|\s+)(place\s*of\s*origin|quê\s*quán|que\s*quan)[\s:：\-|/]*", " ", origin_roi)
+        # Giữ nguyên dấu tiếng Việt, loại bỏ ký tự đặc biệt không cần thiết
+        origin_roi = re.sub(r"[^A-Za-zÀ-ỹ0-9\s,\.]", " ", origin_roi)
+        origin_roi = re.sub(r"\s+", " ", origin_roi).strip()
         out["place_of_origin"] = _normalize(origin_roi)
     if not out.get("place_of_origin"):
         # fallback text-based
         origin = collect_after(
             anchors=ANCHORS["origin"],
             stop_keywords=ANCHORS["residence"] + ANCHORS["expiry"] + ANCHORS["issue"],
-            max_lines=2,
+            max_lines=3,  # Tăng số dòng để lấy đủ thông tin
         )
         if origin:
             origin_clean = _remove_anchors(origin, ANCHORS["origin"]) 
-            origin_clean = _cut_before_next_label(origin_clean, ANCHORS["residence"] + ANCHORS["expiry"] + ANCHORS["issue"]) 
-            out["place_of_origin"] = origin_clean
+            origin_clean = _cut_before_next_label(origin_clean, ANCHORS["residence"] + ANCHORS["expiry"] + ANCHORS["issue"])
+            # Làm sạch và giữ nguyên dấu tiếng Việt
+            origin_clean = re.sub(r"(?i)(^|\s+)(place\s*of\s*origin|quê\s*quán|que\s*quan)[\s:：\-|/]*", " ", origin_clean)
+            origin_clean = re.sub(r"[^A-Za-zÀ-ỹ0-9\s,\.]", " ", origin_clean)
+            origin_clean = re.sub(r"\s+", " ", origin_clean)
+            origin_clean = re.sub(r"\s*,\s*", ", ", origin_clean).strip()
+            out["place_of_origin"] = _normalize(origin_clean)
     # Nơi thường trú (Place of residence)
-    # Nơi thường trú: ưu tiên anchor+bbox
-    residence_roi = _read_right_of_anchor(image_bgr, ocr, items, ANCHORS["residence"]) 
-    if residence_roi:
-        # loại ngày tháng nếu OCR lẫn vào
-        residence_roi = re.sub(r"\b\d{2}[\/-]\d{2}[\/-]\d{4}.*$", "", residence_roi).strip()
-        residence_roi = re.sub(r"(?i)place\s*of\s*residen[ce]\s*[:：-]*", "", residence_roi)
-        out["residence"] = _normalize(residence_roi)
+    # Cách tiếp cận mới: Tìm anchor "Nơi thường trú" và anchor "Có giá trị đến", đọc ROI giữa 2 anchor này
+    residence_anchor_box = _find_anchor_box(items, ANCHORS["residence"], ['place', 'residen', 'residence', 'noi', 'thuong', 'tru'])
+    expiry_anchor_box = _find_anchor_box(items, ANCHORS["expiry"], ['co', 'gia', 'tri', 'den', 'valid', 'until', 'expiry'])
+    
+    if residence_anchor_box and expiry_anchor_box:
+        H, W = image_bgr.shape[:2]
+        rx1, ry1, rx2, ry2 = _box_to_rect(residence_anchor_box)
+        ex1, ey1, ex2, ey2 = _box_to_rect(expiry_anchor_box)
+        
+        # Tạo ROI từ bên phải của "Nơi thường trú" đến trước "Có giá trị đến"
+        roi_x1 = min(rx2 + 2, W - 1)
+        roi_x2 = min(W - 1, ex1 - 5)  # Dừng trước anchor "Có giá trị đến"
+        roi_y1 = max(0, ry1 - 10)  # Mở rộng lên trên một chút
+        roi_y2 = min(H, ey1 - 5)  # Dừng trước dòng "Có giá trị đến"
+        
+        if roi_x1 < roi_x2 and roi_y1 < roi_y2:
+            residence_roi_img = image_bgr[roi_y1:roi_y2, roi_x1:roi_x2]
+            # Đọc với multipass đầy đủ để nhận diện dấu tốt
+            residence_roi, _, _ = _ocr_multipass_text(ocr, residence_roi_img, fast_mode=False)
+            
+            if residence_roi:
+                # Loại bỏ ngày tháng ở cuối (nhiều format)
+                residence_roi = re.sub(r'\b\d{1,2}[\/\- ]\d{1,2}[\/\- ]\d{4}.*$', '', residence_roi).strip()
+                residence_roi = re.sub(r'\b\d{1,2}\s+\d{1,2}\s+\d{4}.*$', '', residence_roi).strip()
+                # Loại bỏ nhãn nếu có
+                residence_roi = re.sub(r"(?i)(^|\s+)(place\s*of\s*residen[ce]|nơi\s*thường\s*trú|noi\s*thuong\s*tru)[\s:：\-|/]*", " ", residence_roi)
+                # Giữ nguyên dấu tiếng Việt, số, dấu phẩy, dấu chấm
+                residence_roi = re.sub(r"[^A-Za-zÀ-ỹ0-9\s,\.]", " ", residence_roi)
+                # Chuẩn hóa khoảng trắng nhưng giữ dấu phẩy
+                residence_roi = re.sub(r"\s+", " ", residence_roi)
+                residence_roi = re.sub(r"\s*,\s*", ", ", residence_roi).strip()
+                out["residence"] = _normalize(residence_roi)
+    
+    # Fallback: dùng cách cũ nếu không tìm thấy cả 2 anchor
+    if not out.get("residence"):
+        residence_roi = _read_right_of_anchor(
+            image_bgr,
+            ocr,
+            items,
+            ANCHORS["residence"],
+            max_lines=8,
+            max_gap_px=20,
+            right_pad=60,
+            stop_at_date=True,
+            stop_after_anchors=ANCHORS["expiry"],
+        ) 
+        if residence_roi:
+            # Loại bỏ ngày tháng ở cuối (nhiều format: dd/mm/yyyy, dd-mm-yyyy, dd mm yyyy)
+            residence_roi = re.sub(r'\b\d{1,2}[\/\- ]\d{1,2}[\/\- ]\d{4}.*$', '', residence_roi).strip()
+            residence_roi = re.sub(r'\b\d{1,2}\s+\d{1,2}\s+\d{4}.*$', '', residence_roi).strip()
+            # Loại bỏ các pattern ngày tháng khác
+            residence_roi = re.sub(r'\b\d{2}\s+\d{2}\s+\d{4}.*$', '', residence_roi).strip()
+            # loại phần nhãn tiếng Anh và tiếng Việt còn sót
+            residence_roi = re.sub(r"(?i)(^|\s+)(place\s*of\s*residen[ce]|nơi\s*thường\s*trú|noi\s*thuong\s*tru)[\s:：\-|/]*", " ", residence_roi)
+            # Giữ nguyên dấu tiếng Việt, số, dấu phẩy, dấu chấm (cho địa chỉ)
+            residence_roi = re.sub(r"[^A-Za-zÀ-ỹ0-9\s,\.]", " ", residence_roi)
+            # Chuẩn hóa khoảng trắng nhưng giữ dấu phẩy
+            residence_roi = re.sub(r"\s+", " ", residence_roi)
+            residence_roi = re.sub(r"\s*,\s*", ", ", residence_roi).strip()
+            out["residence"] = _normalize(residence_roi)
     if not out.get("residence"):
         # fallback text-based
         residence = collect_after(
             anchors=ANCHORS["residence"],
             stop_keywords=ANCHORS["expiry"] + ANCHORS["issue"] + ANCHORS["gender"],
-            max_lines=3,
+            max_lines=5,  # Tăng số dòng để lấy đủ địa chỉ
         )
         if residence:
             residence = _remove_anchors(residence, ANCHORS["residence"]) 
-            residence = _cut_before_next_label(residence, ANCHORS["expiry"] + ANCHORS["issue"]) 
-            out["residence"] = residence
+            residence = _cut_before_next_label(residence, ANCHORS["expiry"] + ANCHORS["issue"])
+            # Loại bỏ ngày tháng ở cuối (nhiều format)
+            residence = re.sub(r'\b\d{1,2}[\/\- ]\d{1,2}[\/\- ]\d{4}.*$', '', residence).strip()
+            residence = re.sub(r'\b\d{1,2}\s+\d{1,2}\s+\d{4}.*$', '', residence).strip()
+            # Làm sạch và giữ nguyên dấu tiếng Việt
+            residence = re.sub(r"(?i)(^|\s+)(place\s*of\s*residen[ce]|nơi\s*thường\s*trú|noi\s*thuong\s*tru)[\s:：\-|/]*", " ", residence)
+            residence = re.sub(r"[^A-Za-zÀ-ỹ0-9\s,\.]", " ", residence)
+            residence = re.sub(r"\s+", " ", residence)
+            residence = re.sub(r"\s*,\s*", ", ", residence).strip()
+            out["residence"] = _normalize(residence)
     # Fallback mạnh từ full text nếu vẫn chưa có
     if not out.get("residence"):
         res2 = _slice_between(full, start_keywords=ANCHORS["residence"], stop_keywords=ANCHORS["expiry"] + ANCHORS["issue"]) 
         if res2:
-            # Loại bỏ bất kỳ ngày/thời gian ở cuối do OCR lẫn
-            res2 = re.sub(r"\b\d{2}[\/-]\d{2}[\/-]\d{4}.*$", "", res2).strip()
-            out["residence"] = res2
+            # Loại bỏ bất kỳ ngày/thời gian ở cuối do OCR lẫn (nhiều format)
+            res2 = re.sub(r'\b\d{1,2}[\/\- ]\d{1,2}[\/\- ]\d{4}.*$', '', res2).strip()
+            res2 = re.sub(r'\b\d{1,2}\s+\d{1,2}\s+\d{4}.*$', '', res2).strip()
+            # Làm sạch và giữ nguyên dấu tiếng Việt
+            res2 = re.sub(r"(?i)(^|\s+)(place\s*of\s*residen[ce]|nơi\s*thường\s*trú|noi\s*thuong\s*tru)[\s:：\-|/]*", " ", res2)
+            res2 = re.sub(r"[^A-Za-zÀ-ỹ0-9\s,\.]", " ", res2)
+            res2 = re.sub(r"\s+", " ", res2)
+            res2 = re.sub(r"\s*,\s*", ", ", res2).strip()
+            out["residence"] = _normalize(res2)
     # Địa chỉ tổng quát (fallback)
     if not out.get("residence"):
         m = re.search(r"Địa\s*chỉ[: ]+(.+?)(?:Ngày\s*cấp|$)", full, re.I | re.DOTALL)
         if m:
-            out["residence"] = _normalize(m.group(1))
+            res3 = m.group(1)
+            # Loại bỏ ngày tháng nếu có
+            res3 = re.sub(r'\b\d{1,2}[\/\- ]\d{1,2}[\/\- ]\d{4}.*$', '', res3).strip()
+            res3 = re.sub(r'\b\d{1,2}\s+\d{1,2}\s+\d{4}.*$', '', res3).strip()
+            # Làm sạch và giữ nguyên dấu tiếng Việt
+            res3 = re.sub(r"[^A-Za-zÀ-ỹ0-9\s,\.]", " ", res3)
+            res3 = re.sub(r"\s+", " ", res3)
+            res3 = re.sub(r"\s*,\s*", ", ", res3).strip()
+            out["residence"] = _normalize(res3)
 
     # Ngày cấp + Nơi cấp (ưu tiên theo anchor-box "issue")
     issue_roi = _read_right_of_anchor(image_bgr, ocr, items, ANCHORS["issue"])

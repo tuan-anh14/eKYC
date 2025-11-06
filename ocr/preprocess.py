@@ -50,4 +50,33 @@ def preprocess_for_ocr(image_bgr):
     th = adaptive_thresh(g)
     return th
 
+def preprocess_for_ocr_v2(image_bgr):
+    """Tiền xử lý phiên bản 2: gray -> CLAHE -> denoise -> morphological operations."""
+    g = to_gray(image_bgr)
+    g = clahe_equalize(g)
+    g = denoise(g)
+    # Morphological operations để làm rõ chữ
+    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (2, 2))
+    g = cv2.morphologyEx(g, cv2.MORPH_CLOSE, kernel)
+    g = cv2.morphologyEx(g, cv2.MORPH_OPEN, kernel)
+    # Adaptive threshold với tham số khác
+    th = cv2.adaptiveThreshold(
+        g,
+        255,
+        cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+        cv2.THRESH_BINARY,
+        21,
+        8,
+    )
+    return th
+
+def preprocess_for_ocr_v3(image_bgr):
+    """Tiền xử lý phiên bản 3: gray -> CLAHE -> Otsu threshold."""
+    g = to_gray(image_bgr)
+    g = clahe_equalize(g)
+    g = denoise(g)
+    # Otsu threshold
+    _, th = cv2.threshold(g, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    return th
+
 
