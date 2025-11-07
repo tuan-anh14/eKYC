@@ -89,7 +89,8 @@ class IDCardPhoto(QWidget):
             pixmap = QPixmap(file_name)
             img = cv.imread(file_name)
             width, height = self.rescale_image(img.shape[1], img.shape[0])
-            self.in_image.setGeometry(QRect(800 - width //2 , 150, width, height))
+            # Đặt ảnh bên trái, cách lề trái 50px
+            self.in_image.setGeometry(QRect(50, 150, width, height))
             self.in_image.setPixmap(pixmap.scaled(width, height))  
             self.in_image.show()
             
@@ -107,15 +108,16 @@ class IDCardPhoto(QWidget):
 
     def _create_ocr_fields(self):
         """Tạo các text field để hiển thị và chỉnh sửa kết quả OCR"""
+        # Đặt các trường OCR bên phải, bắt đầu từ x=900 để tránh đè lên ảnh
         field_labels = {
-            'id_number': ('Số CCCD:', 1000, 150),
-            'name': ('Họ và tên:', 1000, 200),
-            'dob': ('Ngày sinh:', 1000, 250),
-            'gender': ('Giới tính:', 1000, 300),
-            'nationality': ('Quốc tịch:', 1000, 350),
-            'place_of_origin': ('Quê quán:', 1000, 400),
-            'residence': ('Nơi thường trú:', 1000, 450),
-            'expiry_date': ('Có giá trị đến:', 1000, 550),
+            'id_number': ('Số CCCD:', 900, 150),
+            'name': ('Họ và tên:', 900, 200),
+            'dob': ('Ngày sinh:', 900, 250),
+            'gender': ('Giới tính:', 900, 300),
+            'nationality': ('Quốc tịch:', 900, 350),
+            'place_of_origin': ('Quê quán:', 900, 400),
+            'residence': ('Nơi thường trú:', 900, 450),
+            'expiry_date': ('Có giá trị đến:', 900, 550),
         }
         
         self.ocr_text_fields = {}
@@ -174,7 +176,7 @@ class IDCardPhoto(QWidget):
         # Thông báo đang xử lý
         self.error_label.setText("Đang trích xuất thông tin từ ảnh...")
         self.error_label.setStyleSheet("color: blue;")
-        self.error_label.setGeometry(QRect(1000, 100, 500, 30))
+        self.error_label.setGeometry(QRect(900, 100, 500, 30))
         self.error_label.show()
 
         # Disable buttons trong lúc xử lý
@@ -200,7 +202,7 @@ class IDCardPhoto(QWidget):
         if not is_valid:
             self.error_label.setText(error_msg)
             self.error_label.setStyleSheet("color: red;")
-            self.error_label.setGeometry(QRect(1000, 100, 500, 50))
+            self.error_label.setGeometry(QRect(900, 100, 500, 50))
             self.error_label.show()
         else:
             self.next.setDisabled(False)
