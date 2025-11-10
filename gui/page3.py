@@ -16,7 +16,7 @@ class ChallengeWindow(QDialog):
         self.window_width = 1600
                 
         # Thiết lập tiêu đề và kích thước của cửa sổ
-        self.setWindowTitle('Challenge response')
+        self.setWindowTitle('Phát hiện người thật')
         self.setGeometry(100, 100, self.window_width, self.window_heigt)
         self.setFixedSize(self.window_width, self.window_heigt)
 
@@ -25,7 +25,7 @@ class ChallengeWindow(QDialog):
         self.font.setFamily("Times New Roman")
 
         self.label = QLabel(self)
-        self.label.setText('Verify your authenticity by completing the following challenges.')
+        self.label.setText('Xác thực danh tính của bạn bằng cách hoàn thành các thử thách sau.')
         self.label.move(520, 100)
         self.label.setFont(self.font)
         
@@ -40,8 +40,8 @@ class ChallengeWindow(QDialog):
         self.timer = QTimer(self)
         
         # button 
-        self.next = add_button(self, "Exit", 1280, 700, 150, 50, exit)
-        self.back = add_button(self, "Back", 320, 700, 150, 50, self.back_switch_page)
+        self.next = add_button(self, "Thoát", 1280, 700, 150, 50, exit)
+        self.back = add_button(self, "Quay lại", 320, 700, 150, 50, self.back_switch_page)
         
         #  models
         self.list_models = list_models
@@ -75,14 +75,14 @@ class ChallengeWindow(QDialog):
                     self.update_challenge_label(question = self.question)
                     
                 elif self.isCorrect == True and self.count_correct < 3:
-                    self.update_challenge_label(text = "<font color = green>Correct!</font>")
+                    self.update_challenge_label(text = "<font color = green>Đúng!</font>")
                     self.count_frame += 1
 
                     if self.count_frame == 100:
                         self.count_correct += 1        
                         self.count_frame = 0
                         if self.count_correct == 3:
-                            self.update_challenge_label(text = "<font color = green>You have successfully established your identity!</font>", coordinates = (600, 650))
+                            self.update_challenge_label(text = "<font color = green>Bạn đã xác thực danh tính thành công!</font>", coordinates = (600, 650))
                         else:
                             self.challenge, self.question = get_challenge_and_question()
                             self.update_challenge_label(question = self.question)
@@ -122,9 +122,9 @@ class ChallengeWindow(QDialog):
             
         if question is not None:
             if isinstance(self.question, str):
-                text = f"Question {self.count_correct + 1}/3: {self.question}"
+                text = f"Câu hỏi {self.count_correct + 1}/3: {self.question}"
             else:
-                text = f"Question {self.count_correct + 1}/3: {self.question[0]}"
+                text = f"Câu hỏi {self.count_correct + 1}/3: {self.question[0]}"
             self.challenge_label.setText(text)
             self.challenge_label.move(580, 650)
         

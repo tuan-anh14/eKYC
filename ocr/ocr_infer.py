@@ -83,6 +83,33 @@ def _ocr_collect_lines(ocr: PaddleOCR, image) -> Tuple[List[str], List[float]]:
         # Fallback cho API mới
         result = ocr.predict(_ensure_bgr(image))
 
+    # Hỗ trợ OCRResult từ PaddleX
+    if isinstance(result, list) and len(result) == 1:
+        page = result[0]
+        # Kiểm tra nếu là OCRResult từ PaddleX
+        if type(page).__name__ == 'OCRResult' or hasattr(page, 'rec_texts') or hasattr(page, 'boxes'):
+            texts = getattr(page, 'rec_texts', None) or getattr(page, 'texts', None)
+            scores = getattr(page, 'rec_scores', None) or getattr(page, 'scores', None)
+            
+            if texts is not None:
+                import numpy as np
+                if isinstance(texts, np.ndarray):
+                    texts = texts.tolist()
+                if scores is not None and isinstance(scores, np.ndarray):
+                    scores = scores.tolist()
+                
+                n = len(texts)
+                for i in range(n):
+                    txt = str(texts[i]) if texts[i] is not None else ''
+                    if txt:
+                        lines.append(txt)
+                        try:
+                            conf = float(scores[i]) if scores is not None and scores[i] is not None else 1.0
+                            confs.append(conf)
+                        except Exception:
+                            confs.append(1.0)
+                return lines, confs
+
     # Hỗ trợ nhiều định dạng trả về của PaddleOCR
     if isinstance(result, list) and len(result) == 1 and isinstance(result[0], dict):
         page = result[0]
@@ -146,38 +173,175 @@ def _ocr_collect_lines(ocr: PaddleOCR, image) -> Tuple[List[str], List[float]]:
                     confs.append(1.0)
     return lines, confs
 
-def _ocr_collect_with_crops(ocr: PaddleOCR, image_bgr) -> List[Tuple[str, float, any, List[List[int]]]]:
-    """Thu thập (text, conf, crop_bgr, box) từ PaddleOCR (ưu tiên dùng cls để ổn định góc)."""
+def _parse_paddlex_ocrresult(page, image_bgr) -> List[Tuple[str, float, any, List[List[int]]]]:
+    """Parse OCRResult từ PaddleX thành format chuẩn (text, conf, crop, box)."""
     items: List[Tuple[str, float, any, List[List[int]]]] = []
     try:
-        result = ocr.ocr(_ensure_bgr(image_bgr), cls=True)
-    except Exception:
-        try:
-            result = ocr.predict(_ensure_bgr(image_bgr))
-        except Exception:
+        # PaddleX OCRResult thường có các thuộc tính:
+        #   page.boxes hoặc page.dt_polys -> list/ndarray shape [N, 4, 2] (4 điểm)
+        #   page.rec_texts -> list[str]
+        #   page.rec_scores -> list[float]
+        boxes = getattr(page, 'boxes', None) or getattr(page, 'dt_polys', None)
+        texts = getattr(page, 'rec_texts', None) or getattr(page, 'texts', None)
+        scores = getattr(page, 'rec_scores', None) or getattr(page, 'scores', None)
+        
+        if boxes is None or texts is None:
+            _dbg('_parse_paddlex_ocrresult: boxes or texts is None')
             return items
-    if not isinstance(result, list):
-        return items
-    for page in result:
-        if not isinstance(page, list):
-            continue
-        for det in page:
+        
+        # Convert numpy array to list if needed
+        import numpy as np
+        if isinstance(boxes, np.ndarray):
+            boxes = boxes.tolist()
+        if isinstance(texts, np.ndarray):
+            texts = texts.tolist()
+        if scores is not None and isinstance(scores, np.ndarray):
+            scores = scores.tolist()
+        
+        n = min(len(boxes), len(texts), len(scores) if scores is not None else len(texts))
+        H, W = image_bgr.shape[:2]
+        
+        _dbg(f'_parse_paddlex_ocrresult: parsing {n} detections')
+        
+        for i in range(n):
             try:
-                if not isinstance(det, list) or len(det) != 2:
+                box = boxes[i]
+                # Chuẩn hóa box về [[x1,y1],[x2,y1],[x2,y2],[x1,y2]]
+                if isinstance(box, np.ndarray):
+                    box = box.tolist()
+                
+                # Box có thể là [4, 2] hoặc [[x1,y1],[x2,y1],[x2,y2],[x1,y2]]
+                xs = []
+                ys = []
+                for p in box:
+                    if isinstance(p, (list, tuple)) and len(p) >= 2:
+                        xs.append(int(float(p[0])))
+                        ys.append(int(float(p[1])))
+                    elif isinstance(p, np.ndarray):
+                        xs.append(int(float(p[0])))
+                        ys.append(int(float(p[1])))
+                
+                if not xs or not ys:
                     continue
+                
+                x1, x2 = max(min(xs), 0), min(max(xs), W - 1)
+                y1, y2 = max(min(ys), 0), min(max(ys), H - 1)
+                
+                if x1 >= x2 or y1 >= y2:
+                    continue
+                
+                crop = image_bgr[y1:y2, x1:x2]
+                txt = str(texts[i]) if texts[i] is not None else ''
+                conf = float(scores[i]) if scores is not None and scores[i] is not None else 1.0
+                
+                # Tạo box format chuẩn
+                box_standard = [[x1, y1], [x2, y1], [x2, y2], [x1, y2]]
+                items.append((txt, conf, crop, box_standard))
+            except Exception as e:
+                _dbg(f'_parse_paddlex_ocrresult: exception at index {i}:', str(e))
+                continue
+        
+        _dbg(f'_parse_paddlex_ocrresult: parsed {len(items)} items')
+    except Exception as e:
+        _dbg('_parse_paddlex_ocrresult: exception:', str(e))
+    return items
+
+def _ocr_collect_with_crops(ocr: PaddleOCR, image_bgr) -> List[Tuple[str, float, any, List[List[int]]]]:
+    """Thu thập (text, conf, crop_bgr, box) từ PaddleOCR."""
+    items: List[Tuple[str, float, any, List[List[int]]]] = []
+    
+    # Debug: Kiểm tra image
+    if image_bgr is None:
+        _dbg('_ocr_collect_with_crops: image_bgr is None')
+        return items
+    _dbg('_ocr_collect_with_crops: image shape:', image_bgr.shape if hasattr(image_bgr, 'shape') else 'no shape')
+    
+    # Đảm bảo image là BGR
+    image_bgr = _ensure_bgr(image_bgr)
+    
+    result = None
+    try:
+        # Bỏ cls=True vì không được hỗ trợ trong một số version
+        _dbg('_ocr_collect_with_crops: calling ocr.ocr')
+        result = ocr.ocr(image_bgr)
+        _dbg('_ocr_collect_with_crops: ocr.ocr returned, type:', type(result))
+    except Exception as e:
+        _dbg('_ocr_collect_with_crops: ocr.ocr failed:', str(e))
+        try:
+            _dbg('_ocr_collect_with_crops: trying ocr.predict')
+            result = ocr.predict(image_bgr)
+            _dbg('_ocr_collect_with_crops: ocr.predict returned, type:', type(result))
+        except Exception as e2:
+            _dbg('_ocr_collect_with_crops: ocr.predict also failed:', str(e2))
+            return items
+    
+    if result is None:
+        _dbg('_ocr_collect_with_crops: result is None')
+        return items
+    
+    _dbg('_ocr_collect_with_crops: result type:', type(result), 'is_list:', isinstance(result, list))
+    
+    if not isinstance(result, list):
+        _dbg('_ocr_collect_with_crops: result is not a list, returning empty')
+        return items
+    
+    _dbg('_ocr_collect_with_crops: result length:', len(result))
+    
+    # Xử lý OCRResult từ PaddleX
+    if len(result) == 1:
+        page = result[0]
+        # Kiểm tra nếu là OCRResult từ PaddleX
+        if type(page).__name__ == 'OCRResult' or hasattr(page, 'rec_texts') or hasattr(page, 'boxes'):
+            _dbg('_ocr_collect_with_crops: detected OCRResult format, parsing...')
+            items.extend(_parse_paddlex_ocrresult(page, image_bgr))
+            _dbg('_ocr_collect_with_crops: final items count (OCRResult):', len(items))
+            return items
+    
+    # PaddleOCR format chuẩn: [[[box, (text, conf)], ...]]
+    page_count = 0
+    for page_idx, page in enumerate(result):
+        page_count += 1
+        _dbg(f'_ocr_collect_with_crops: page {page_idx}, type:', type(page))
+        
+        if isinstance(page, dict):
+            # Format dict: {'ocr_result': [...]}
+            ocr_result = page.get('ocr_result', [])
+            _dbg(f'_ocr_collect_with_crops: page {page_idx} is dict, ocr_result length:', len(ocr_result))
+            page = ocr_result
+        
+        if not isinstance(page, list):
+            _dbg(f'_ocr_collect_with_crops: page {page_idx} is not a list, skipping')
+            continue
+        
+        _dbg(f'_ocr_collect_with_crops: page {page_idx} length:', len(page))
+        
+        for det_idx, det in enumerate(page):
+            try:
+                if not isinstance(det, list):
+                    continue
+                
+                if len(det) != 2:
+                    continue
+                
                 box, txt_conf = det
+                
                 if not (isinstance(txt_conf, (list, tuple)) and len(txt_conf) >= 2):
                     continue
+                
                 txt = str(txt_conf[0])
                 conf = float(txt_conf[1]) if txt_conf[1] is not None else 0.0
+                
                 xs = [int(p[0]) for p in box]
                 ys = [int(p[1]) for p in box]
                 x1, x2 = max(min(xs), 0), min(max(xs), image_bgr.shape[1])
                 y1, y2 = max(min(ys), 0), min(max(ys), image_bgr.shape[0])
                 crop = image_bgr[y1:y2, x1:x2]
                 items.append((txt, conf, crop, box))
-            except Exception:
+            except Exception as e:
+                _dbg(f'_ocr_collect_with_crops: det {det_idx} exception:', str(e))
                 continue
+    
+    _dbg('_ocr_collect_with_crops: final items count:', len(items), 'page_count:', page_count)
     return items
 
 
@@ -192,13 +356,71 @@ def _count_vietnamese_chars(text: str) -> int:
             count += 1
     return count
 
-def _ocr_multipass_text(ocr: PaddleOCR, image_bgr, fast_mode: bool = False) -> Tuple[str, float, List[str]]:
+def _ocr_with_vietocr(image_bgr, use_vietocr: bool = True) -> Optional[str]:
+    """Chạy VietOCR trên ảnh. Trả về text hoặc None nếu lỗi."""
+    if not use_vietocr:
+        return None
+    viet = get_vietocr_instance()
+    if viet is None:
+        return None
+    try:
+        # VietOCR cần ảnh RGB
+        if len(image_bgr.shape) == 3:
+            image_rgb = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2RGB)
+        else:
+            image_rgb = image_bgr
+        result = viet.predict(image_rgb)
+        return str(result) if result else None
+    except Exception as e:
+        _dbg('VietOCR error:', str(e))
+        return None
+
+def _hybrid_ocr_roi(image_bgr, ocr: PaddleOCR, use_vietocr: bool = True) -> Tuple[str, float]:
+    """Chạy hybrid OCR (PaddleOCR + VietOCR) trên ROI và chọn kết quả tốt nhất.
+    Trả về: (best_text, confidence)
+    """
+    candidates: List[Tuple[str, float, int]] = []  # (text, conf, viet_count)
+    
+    # PaddleOCR với multipass (không dùng VietOCR trong multipass để tránh trùng)
+    paddle_text, paddle_conf, _ = _ocr_multipass_text(ocr, image_bgr, fast_mode=False, use_vietocr=False)
+    if paddle_text:
+        viet_count = _count_vietnamese_chars(paddle_text)
+        candidates.append((paddle_text, paddle_conf, viet_count))
+    
+    # VietOCR riêng biệt nếu có - chạy trực tiếp trên ROI
+    if use_vietocr:
+        viet_text = _ocr_with_vietocr(image_bgr, use_vietocr=True)
+        if viet_text:
+            viet_text = _normalize(viet_text)
+            viet_count = _count_vietnamese_chars(viet_text)
+            # VietOCR không có confidence, ước tính dựa trên độ dài và số ký tự tiếng Việt
+            estimated_conf = min(0.95, 0.75 + (viet_count / max(1, len(viet_text))) * 0.2)
+            candidates.append((viet_text, estimated_conf, viet_count))
+            _dbg('VietOCR result:', viet_text[:100] + '...' if len(viet_text) > 100 else viet_text, 'viet_count:', viet_count)
+        else:
+            _dbg('VietOCR returned None or empty')
+    else:
+        _dbg('VietOCR disabled (use_vietocr=False)')
+    
+    if not candidates:
+        _dbg('No OCR candidates found')
+        return "", 0.0
+    
+    # Chọn kết quả tốt nhất: ưu tiên có nhiều ký tự tiếng Việt có dấu
+    # Score = viet_count * 0.7 + confidence * 0.3 (ưu tiên cao hơn cho tiếng Việt)
+    best_text, best_conf, best_viet_count = max(candidates, key=lambda x: (x[2] * 0.7 + x[1] * 0.3))
+    _dbg('Hybrid OCR selected:', best_text[:100] + '...' if len(best_text) > 100 else best_text, 
+         'viet_count:', best_viet_count, 'conf:', f'{best_conf:.2f}')
+    return best_text, best_conf
+
+def _ocr_multipass_text(ocr: PaddleOCR, image_bgr, fast_mode: bool = False, use_vietocr: bool = False) -> Tuple[str, float, List[str]]:
     """Chạy OCR nhiều pass (resize + preprocess) và chọn kết quả tốt nhất.
     Ưu tiên kết quả có nhiều ký tự tiếng Việt có dấu và confidence cao.
     Trả về: (full_text, avg_conf, lines)
     
     Args:
         fast_mode: Nếu True, chỉ chạy 1 pass (resize) để tăng tốc
+        use_vietocr: Nếu True, thử dùng VietOCR để refine kết quả
     """
     candidates: List[Tuple[str, float, List[str], int]] = []  # (text, conf, lines, viet_count)
     
@@ -215,6 +437,11 @@ def _ocr_multipass_text(ocr: PaddleOCR, image_bgr, fast_mode: bool = False) -> T
     if fast_mode:
         if candidates:
             best_text, best_conf, best_lines, _ = candidates[0]
+            # Nếu use_vietocr và kết quả có ít ký tự tiếng Việt, thử VietOCR
+            if use_vietocr and _count_vietnamese_chars(best_text) < len(best_text) * 0.1:
+                viet_text = _ocr_with_vietocr(image_bgr, use_vietocr=True)
+                if viet_text and _count_vietnamese_chars(viet_text) > _count_vietnamese_chars(best_text):
+                    return _normalize(viet_text), float(best_conf), [viet_text]
             return _normalize(best_text), float(best_conf), best_lines
         return "", 0.0, []
     
@@ -226,6 +453,16 @@ def _ocr_multipass_text(ocr: PaddleOCR, image_bgr, fast_mode: bool = False) -> T
         avg2 = sum(confs2) / max(1, len(confs2))
         viet_count2 = _count_vietnamese_chars(text2)
         candidates.append((text2, avg2, lines2, viet_count2))
+    
+    # Pass 3: thử VietOCR nếu được yêu cầu và có ít ký tự tiếng Việt
+    if use_vietocr:
+        viet_text = _ocr_with_vietocr(image_bgr, use_vietocr=True)
+        if viet_text:
+            viet_text = _normalize(viet_text)
+            viet_count = _count_vietnamese_chars(viet_text)
+            # Ước tính confidence cho VietOCR
+            estimated_conf = min(0.95, 0.75 + (viet_count / max(1, len(viet_text))) * 0.2)
+            candidates.append((viet_text, estimated_conf, [viet_text], viet_count))
 
     if not candidates:
         return "", 0.0, []
@@ -331,29 +568,86 @@ def _norm_no_accents(s: str) -> str:
     return re.sub(r"\s+", " ", s).strip()
 
 def _is_anchor(text: str, anchors: List[str]) -> bool:
-    t = _norm_no_accents(text)
+    """Kiểm tra xem text có chứa anchor không. 
+    Tìm anchor ở đầu text hoặc bất kỳ đâu trong text (vì có thể có format như "Họ và tên / Full name:")"""
+    if not text:
+        return False
+    t = _norm_no_accents(text.lower())
     for a in anchors:
-        if _norm_no_accents(a) in t:
-            return True
+        a_norm = _norm_no_accents(a.lower())
+        # Tìm anchor ở đầu text (có thể có khoảng trắng hoặc dấu phân cách trước)
+        # Hoặc tìm anchor ở bất kỳ đâu trong text
+        if a_norm in t:
+            # Kiểm tra xem anchor có ở đầu text không (sau khi bỏ khoảng trắng và dấu phân cách)
+            t_clean = re.sub(r'^[\s:：\-\|/]+', '', t)
+            if t_clean.startswith(a_norm):
+                return True
+            # Hoặc anchor nằm ở bất kỳ đâu trong text (nhưng không phải là một phần của từ khác)
+            # Tìm anchor với word boundary
+            pattern = r'\b' + re.escape(a_norm) + r'\b'
+            if re.search(pattern, t):
+                return True
+            # Fallback: tìm đơn giản nếu anchor đủ dài
+            if len(a_norm) >= 5 and a_norm in t:
+                return True
     return False
 
 def _find_anchor_box(items, anchors: List[str], alt_tokens: List[str]) -> Optional[List[List[int]]]:
     """Tìm box nhãn: ưu tiên khớp full anchor; nếu không, khớp theo từ khoá rời (alt_tokens)."""
     candidates = []
+    
+    # Debug: Log một số items đầu tiên để xem text được OCR ra
+    if len(items) > 0:
+        sample_texts = [txt[:50] for txt, _, _, _ in items[:5]]
+        _dbg('Sample OCR texts:', sample_texts)
+    
+    # Ưu tiên 1: Tìm khớp full anchor trong từng item
     for txt, conf, crop, box in items:
         if _is_anchor(txt, anchors):
-            candidates.append(box)
+            _dbg('Found anchor (priority 1):', txt[:50], 'for anchors:', anchors[:2])
+            candidates.append((box, 1))  # Priority 1: full match
+    
+    # Ưu tiên 2: Tìm theo token rời trong từng item
+    if not candidates:
+        for txt, conf, crop, box in items:
+            nt = _norm_no_accents(txt)
+            matched_tokens = [tok for tok in alt_tokens if tok in nt]
+            if matched_tokens:
+                _dbg('Found anchor (priority 2):', txt[:50], 'matched tokens:', matched_tokens)
+                candidates.append((box, 2))  # Priority 2: token match
+    
+    # Ưu tiên 3: Ghép các item thành dòng và tìm anchor trên dòng
+    if not candidates:
+        grouped_lines = _group_lines(items)
+        _dbg('Grouped lines count:', len(grouped_lines))
+        for line_text, rects in grouped_lines:
+            line_norm = _norm_no_accents(line_text)
+            if _is_anchor(line_text, anchors):
+                _dbg('Found anchor (priority 3 - line):', line_text[:80], 'for anchors:', anchors[:2])
+                # lấy union rect của các rects thuộc dòng
+                xs1 = [r[0] for r in rects]; ys1 = [r[1] for r in rects]
+                xs2 = [r[2] for r in rects]; ys2 = [r[3] for r in rects]
+                ax1, ay1, ax2, ay2 = min(xs1), min(ys1), max(xs2), max(ys2)
+                anchor_box = [[ax1, ay1], [ax2, ay1], [ax2, ay2], [ax1, ay2]]
+                candidates.append((anchor_box, 3))  # Priority 3: line match
+            else:
+                # Thử tìm theo token trong dòng
+                matched_tokens = [tok for tok in alt_tokens if tok in line_norm]
+                if matched_tokens:
+                    _dbg('Found anchor (priority 3 - line token):', line_text[:80], 'matched tokens:', matched_tokens)
+                    xs1 = [r[0] for r in rects]; ys1 = [r[1] for r in rects]
+                    xs2 = [r[2] for r in rects]; ys2 = [r[3] for r in rects]
+                    ax1, ay1, ax2, ay2 = min(xs1), min(ys1), max(xs2), max(ys2)
+                    anchor_box = [[ax1, ay1], [ax2, ay1], [ax2, ay2], [ax1, ay2]]
+                    candidates.append((anchor_box, 3))
+    
     if candidates:
-        candidates.sort(key=lambda b: _box_to_rect(b)[0])
-        return candidates[0]
-    # fallback: tìm theo token rời
-    for txt, conf, crop, box in items:
-        nt = _norm_no_accents(txt)
-        if any(tok in nt for tok in alt_tokens):
-            candidates.append(box)
-    if candidates:
-        candidates.sort(key=lambda b: _box_to_rect(b)[0])
-        return candidates[0]
+        # Sắp xếp theo priority (thấp hơn = tốt hơn), sau đó theo x
+        candidates.sort(key=lambda x: (x[1], _box_to_rect(x[0])[0]))
+        _dbg('Anchor found, returning box')
+        return candidates[0][0]
+    
+    _dbg('No anchor found after all attempts, items count:', len(items))
     return None
 
 def _box_to_rect(box: List[List[int]]) -> Tuple[int, int, int, int]:
@@ -420,17 +714,30 @@ def _read_right_of_anchor(image_bgr, ocr: PaddleOCR, items, anchors: List[str], 
     )
     anchor_box = _find_anchor_box(items, anchors, alt_map.get(key, []))
     if anchor_box is None:
-        # Thử ghép theo dòng rồi tìm anchor trên toàn dòng
-        for line_text, rects in _group_lines(items):
-            if _is_anchor(line_text, anchors) or any(tok in _norm_no_accents(line_text) for tok in alt_map.get(key, [])):
-                # lấy union rect của các rects thuộc dòng
-                xs1 = [r[0] for r in rects]; ys1 = [r[1] for r in rects]
-                xs2 = [r[2] for r in rects]; ys2 = [r[3] for r in rects]
-                ax1, ay1, ax2, ay2 = min(xs1), min(ys1), max(xs2), max(ys2)
-                anchor_box = [[ax1, ay1], [ax2, ay1], [ax2, ay2], [ax1, ay2]]
+        _dbg('no_anchor_found_for', anchors[:2])
+        # Nếu không tìm thấy anchor, vẫn cố gắng tạo ROI dựa trên vị trí ước tính
+        # Dựa trên vị trí trung bình của các items để tạo ROI
+        if not items:
+            return ""
+        # Tìm item đầu tiên có text chứa một phần anchor
+        anchor_box = None
+        for txt, conf, crop, box in items:
+            nt = _norm_no_accents(txt)
+            for anchor in anchors:
+                anchor_norm = _norm_no_accents(anchor)
+                # Tìm nếu có một phần của anchor trong text
+                if len(anchor_norm) >= 3 and any(word in nt for word in anchor_norm.split() if len(word) >= 3):
+                    anchor_box = box
+                    break
+            if anchor_box is not None:
                 break
+        
+        # Nếu vẫn không tìm thấy, dùng box đầu tiên làm anchor ước tính
+        if anchor_box is None and items:
+            anchor_box = items[0][3]  # Lấy box của item đầu tiên
+            _dbg('using_first_item_as_anchor_estimate')
+        
         if anchor_box is None:
-            _dbg('no_anchor_found_for', anchors[:2])
             return ""
     ax1, ay1, ax2, ay2 = _box_to_rect(anchor_box)
     mid_y = (ay1 + ay2) // 2
@@ -476,18 +783,19 @@ def _read_right_of_anchor(image_bgr, ocr: PaddleOCR, items, anchors: List[str], 
         
         # Tính khoảng cách theo chiều dọc từ anchor
         vertical_dist = abs(my - mid_y)
-        # Tăng threshold để lấy được nhiều dòng hơn
-        line_threshold = max(12, line_height // 2 + max_gap_px * 2)
+        # Cải thiện threshold: dựa trên chiều cao dòng và khoảng cách thực tế
+        # Sử dụng tỷ lệ động thay vì giá trị cố định
+        line_threshold = max(line_height * 0.6, line_height // 2 + max_gap_px)
         
         # Nếu max_lines > 1, thu thập cả các dòng dưới
         if max_lines > 1:
             # Cho phép các box trên cùng dòng hoặc các dòng tiếp theo
-            # Tăng threshold để lấy được nhiều dòng hơn
-            max_vertical_dist = line_threshold * max_lines * 1.5  # Tăng 1.5x để lấy đủ dòng
+            # Tính toán chính xác hơn dựa trên chiều cao dòng
+            max_vertical_dist = line_height * max_lines * 1.2  # 1.2x để lấy đủ dòng nhưng không quá xa
             if vertical_dist <= max_vertical_dist:
                 all_candidate_boxes.append((x1, y1, x2, y2, my, txt))
         else:
-            # Chỉ lấy box trên cùng dòng
+            # Chỉ lấy box trên cùng dòng - threshold chặt chẽ hơn
             if vertical_dist <= line_threshold:
                 line_boxes.append((x1, y1, x2, y2))
     
@@ -505,7 +813,9 @@ def _read_right_of_anchor(image_bgr, ocr: PaddleOCR, items, anchors: List[str], 
             if stop_at_date and _is_date_pattern(box[5]):
                 _dbg('stopping_at_date_in_line', box[5])
                 break
-            if abs(box[4] - current_y) <= line_height * 0.8:
+            # Cải thiện logic nhóm dòng: sử dụng threshold động dựa trên chiều cao dòng
+            line_gap_threshold = line_height * 0.7  # 70% chiều cao dòng
+            if abs(box[4] - current_y) <= line_gap_threshold:
                 current_line.append(box)
             else:
                 lines_groups.append(current_line)
@@ -572,12 +882,17 @@ def _read_right_of_anchor(image_bgr, ocr: PaddleOCR, items, anchors: List[str], 
             ry2 = min(H, max(ys2) + 2)
         roi = image_bgr[ry1:ry2, rx1:rx2]
     
-    # Sử dụng fast_mode cho ROI nhỏ để tăng tốc
-    # Dùng multipass đầy đủ cho ROI lớn hoặc khi cần nhận diện dấu tốt (residence, name)
-    # Với residence (max_lines > 5), luôn dùng multipass đầy đủ để nhận diện dấu tốt
-    use_fast = max_lines <= 2 and roi.shape[0] * roi.shape[1] < 50000 and max_lines < 6
-    text, conf, lines = _ocr_multipass_text(ocr, roi, fast_mode=use_fast)
-    _dbg('roi_text', text)
+    # Sử dụng hybrid OCR cho các trường quan trọng (name, origin, residence)
+    # Với các trường này, dùng hybrid OCR để nhận diện dấu tốt hơn
+    # Luôn dùng hybrid OCR cho các trường có nhiều dòng hoặc khi cần nhận diện dấu tốt
+    use_hybrid = max_lines >= 2  # Dùng hybrid cho các trường có nhiều dòng
+    if use_hybrid:
+        text, conf = _hybrid_ocr_roi(roi, ocr, use_vietocr=True)
+    else:
+        # Với ROI nhỏ, vẫn dùng multipass nhưng có thể thử VietOCR nếu cần
+        use_fast = roi.shape[0] * roi.shape[1] < 50000
+        text, conf, _ = _ocr_multipass_text(ocr, roi, fast_mode=use_fast, use_vietocr=False)
+    _dbg('roi_text', text, 'max_lines:', max_lines, 'use_hybrid:', use_hybrid)
     return _normalize(text)
 
 
@@ -632,7 +947,8 @@ def extract_id_fields(image_bgr) -> Dict:
     
     # Họ tên / Name: Tìm anchor và đọc trực tiếp ROI với multipass đầy đủ
     items = _ocr_collect_with_crops(ocr, image_bgr)
-    name_anchor_box = _find_anchor_box(items, ANCHORS["name"], ['full', 'name', 'ho', 'ten'])
+    _dbg('Total OCR items collected:', len(items))
+    name_anchor_box = _find_anchor_box(items, ANCHORS["name"], ['full', 'name', 'ho', 'ten', 'họ', 'tên'])
     
     if name_anchor_box:
         H, W = image_bgr.shape[:2]
@@ -653,8 +969,8 @@ def extract_id_fields(image_bgr) -> Dict:
         
         if roi_x1 < roi_x2 and roi_y1 < roi_y2:
             name_roi_img = image_bgr[roi_y1:roi_y2, roi_x1:roi_x2]
-            # Đọc với multipass đầy đủ để nhận diện dấu tốt
-            name_text, _, _ = _ocr_multipass_text(ocr, name_roi_img, fast_mode=False)
+            # Dùng hybrid OCR để nhận diện dấu tốt hơn
+            name_text, _ = _hybrid_ocr_roi(name_roi_img, ocr, use_vietocr=True)
             
             if name_text:
                 # Loại bỏ nhãn
@@ -688,6 +1004,36 @@ def extract_id_fields(image_bgr) -> Dict:
                         valid_words.append(word)
                 if valid_words:
                     out["name"] = " ".join(valid_words)
+        
+        # Nếu vẫn chưa có, thử dùng hybrid OCR trên toàn bộ vùng name ước tính
+        if not out.get("name") and items:
+            # Tìm dòng có chứa "Họ và tên" hoặc "Full name" trong full text
+            for i, line in enumerate(lines):
+                line_norm = _norm_no_accents(line.lower())
+                if any(anchor_norm in line_norm for anchor_norm in [_norm_no_accents(a).lower() for a in ANCHORS["name"]]):
+                    # Tìm dòng tiếp theo (có thể là name)
+                    if i + 1 < len(lines):
+                        candidate_name = lines[i + 1]
+                        # Dùng hybrid OCR trên dòng này
+                        # Tạo ROI ước tính từ vị trí dòng
+                        H, W = image_bgr.shape[:2]
+                        # Ước tính vị trí dòng dựa trên index
+                        estimated_y = int(H * (i + 1) / max(len(lines), 1))
+                        roi_y1 = max(0, estimated_y - 30)
+                        roi_y2 = min(H, estimated_y + 30)
+                        roi_x1 = int(W * 0.4)  # Bắt đầu từ 40% chiều rộng
+                        roi_x2 = W - 10
+                        if roi_x1 < roi_x2 and roi_y1 < roi_y2:
+                            name_roi_img = image_bgr[roi_y1:roi_y2, roi_x1:roi_x2]
+                            name_text, _ = _hybrid_ocr_roi(name_roi_img, ocr, use_vietocr=True)
+                            if name_text:
+                                name_text = re.sub(r"[^A-Za-zÀ-ỹ\s]", " ", name_text)
+                                name_text = re.sub(r"\s+", " ", name_text).strip()
+                                words = name_text.split()
+                                valid_words = [w for w in words if _uppercase_ratio(w) > 0.5 or any(ord(c) >= 0x00C0 and ord(c) <= 0x1EF9 for c in w)]
+                                if valid_words:
+                                    out["name"] = " ".join(valid_words)
+                                    break
 
     # Nếu chưa có name, fallback text-based (giữ nguyên logic cũ)
     def _normalize_line(s: str) -> str:
@@ -698,21 +1044,36 @@ def extract_id_fields(image_bgr) -> Dict:
 
     def collect_after(anchors: List[str], stop_keywords: List[str], max_lines: int = 3) -> str:
         for i, line_lc in enumerate(norm_lines_lc):
-            if any(a in line_lc for a in anchors):
+            # Tìm anchor trong dòng (có thể là một phần của anchor)
+            anchor_found = False
+            for anchor in anchors:
+                anchor_norm = _norm_no_accents(anchor).lower()
+                # Tìm nếu anchor hoặc một phần của anchor có trong dòng
+                if anchor_norm in line_lc or any(word in line_lc for word in anchor_norm.split() if len(word) >= 3):
+                    anchor_found = True
+                    break
+            
+            if anchor_found:
                 collected: List[str] = []
                 # lấy phần còn lại của dòng hiện tại sau nhãn
                 current = norm_lines[i]
-                # bỏ phần nhãn nếu có
-                current_clean = re.sub(r"(?i)(họ\s*và\s*tên|ho\s*va\s*ten|full\s*name)[:：\-\|]*", "", current).strip()
+                # bỏ phần nhãn nếu có - cải thiện regex để bỏ nhiều loại nhãn hơn
+                for anchor in anchors:
+                    anchor_pattern = re.escape(_norm_no_accents(anchor))
+                    current_clean = re.sub(rf"(?i){anchor_pattern}[:：\-\|/]*", "", current, flags=re.IGNORECASE)
+                    current = current_clean
+                current_clean = current.strip()
                 if current_clean:
                     collected.append(current_clean)
-                # lấy thêm 1-2 dòng tiếp theo cho đến khi gặp stop
+                # lấy thêm các dòng tiếp theo cho đến khi gặp stop
                 for j in range(i + 1, min(len(norm_lines), i + 1 + max_lines)):
                     next_lc = norm_lines_lc[j]
                     if any(sk in next_lc for sk in stop_keywords):
                         break
                     collected.append(norm_lines[j])
-                return _normalize(" ".join(collected))
+                result = _normalize(" ".join(collected))
+                if result:
+                    return result
         return ""
 
     # Heuristic 1: lấy sau nhãn (accent-insensitive), loại tiêu đề nếu dính trên cùng dòng
@@ -767,15 +1128,53 @@ def extract_id_fields(image_bgr) -> Dict:
             if valid_words:
                 out["name"] = " ".join(valid_words)
     
-    # Quê quán (Place of origin): ưu tiên anchor+bbox
-    origin_roi = _read_right_of_anchor(image_bgr, ocr, items, ANCHORS["origin"], max_lines=2)
-    if origin_roi:
-        # loại phần nhãn tiếng Anh và tiếng Việt còn sót
-        origin_roi = re.sub(r"(?i)(^|\s+)(place\s*of\s*origin|quê\s*quán|que\s*quan)[\s:：\-|/]*", " ", origin_roi)
-        # Giữ nguyên dấu tiếng Việt, loại bỏ ký tự đặc biệt không cần thiết
-        origin_roi = re.sub(r"[^A-Za-zÀ-ỹ0-9\s,\.]", " ", origin_roi)
-        origin_roi = re.sub(r"\s+", " ", origin_roi).strip()
-        out["place_of_origin"] = _normalize(origin_roi)
+    # Quê quán (Place of origin): ưu tiên anchor+bbox với hybrid OCR
+    origin_anchor_box = _find_anchor_box(items, ANCHORS["origin"], ['place', 'origin', 'que', 'quan', 'quê', 'quán'])
+    if origin_anchor_box:
+        H, W = image_bgr.shape[:2]
+        ox1, oy1, ox2, oy2 = _box_to_rect(origin_anchor_box)
+        # Tìm anchor tiếp theo (residence hoặc expiry) để biết điểm dừng
+        residence_anchor_box = _find_anchor_box(items, ANCHORS["residence"], ['place', 'residen', 'residence', 'noi', 'thuong', 'tru'])
+        expiry_anchor_box = _find_anchor_box(items, ANCHORS["expiry"], ['co', 'gia', 'tri', 'den', 'valid', 'until'])
+        
+        # Tạo ROI từ bên phải của "Quê quán" đến trước anchor tiếp theo
+        roi_x1 = min(ox2 + 2, W - 1)
+        if residence_anchor_box:
+            rx1, ry1, rx2, ry2 = _box_to_rect(residence_anchor_box)
+            roi_x2 = min(W - 1, rx1 - 5)
+            roi_y2 = min(H, ry1 - 5)
+        elif expiry_anchor_box:
+            ex1, ey1, ex2, ey2 = _box_to_rect(expiry_anchor_box)
+            roi_x2 = min(W - 1, ex1 - 5)
+            roi_y2 = min(H, ey1 - 5)
+        else:
+            roi_x2 = min(W - 1, ox2 + W // 2 + 40)
+            roi_y2 = min(H, oy2 + 60)
+        roi_y1 = max(0, oy1 - 8)
+        
+        if roi_x1 < roi_x2 and roi_y1 < roi_y2:
+            origin_roi_img = image_bgr[roi_y1:roi_y2, roi_x1:roi_x2]
+            # Dùng hybrid OCR để nhận diện dấu tốt hơn
+            origin_roi, _ = _hybrid_ocr_roi(origin_roi_img, ocr, use_vietocr=True)
+            
+            if origin_roi:
+                # loại phần nhãn tiếng Anh và tiếng Việt còn sót
+                origin_roi = re.sub(r"(?i)(^|\s+)(place\s*of\s*origin|quê\s*quán|que\s*quan)[\s:：\-|/]*", " ", origin_roi)
+                # Giữ nguyên dấu tiếng Việt, loại bỏ ký tự đặc biệt không cần thiết
+                origin_roi = re.sub(r"[^A-Za-zÀ-ỹ0-9\s,\.]", " ", origin_roi)
+                origin_roi = re.sub(r"\s+", " ", origin_roi).strip()
+                out["place_of_origin"] = _normalize(origin_roi)
+    
+    # Fallback: dùng cách cũ nếu không tìm thấy anchor
+    if not out.get("place_of_origin"):
+        origin_roi = _read_right_of_anchor(image_bgr, ocr, items, ANCHORS["origin"], max_lines=2)
+        if origin_roi:
+            # loại phần nhãn tiếng Anh và tiếng Việt còn sót
+            origin_roi = re.sub(r"(?i)(^|\s+)(place\s*of\s*origin|quê\s*quán|que\s*quan)[\s:：\-|/]*", " ", origin_roi)
+            # Giữ nguyên dấu tiếng Việt, loại bỏ ký tự đặc biệt không cần thiết
+            origin_roi = re.sub(r"[^A-Za-zÀ-ỹ0-9\s,\.]", " ", origin_roi)
+            origin_roi = re.sub(r"\s+", " ", origin_roi).strip()
+            out["place_of_origin"] = _normalize(origin_roi)
     if not out.get("place_of_origin"):
         # fallback text-based
         origin = collect_after(
@@ -794,7 +1193,7 @@ def extract_id_fields(image_bgr) -> Dict:
             out["place_of_origin"] = _normalize(origin_clean)
     # Nơi thường trú (Place of residence)
     # Cách tiếp cận mới: Tìm anchor "Nơi thường trú" và anchor "Có giá trị đến", đọc ROI giữa 2 anchor này
-    residence_anchor_box = _find_anchor_box(items, ANCHORS["residence"], ['place', 'residen', 'residence', 'noi', 'thuong', 'tru'])
+    residence_anchor_box = _find_anchor_box(items, ANCHORS["residence"], ['place', 'residen', 'residence', 'noi', 'thuong', 'tru', 'nơi', 'thường', 'trú'])
     expiry_anchor_box = _find_anchor_box(items, ANCHORS["expiry"], ['co', 'gia', 'tri', 'den', 'valid', 'until', 'expiry'])
     
     if residence_anchor_box and expiry_anchor_box:
@@ -802,16 +1201,23 @@ def extract_id_fields(image_bgr) -> Dict:
         rx1, ry1, rx2, ry2 = _box_to_rect(residence_anchor_box)
         ex1, ey1, ex2, ey2 = _box_to_rect(expiry_anchor_box)
         
+        # Tính chiều cao dòng để ước tính số dòng cần lấy
+        line_height = ry2 - ry1
+        # Tính số dòng từ residence đến expiry
+        estimated_lines = max(2, int((ey1 - ry1) / max(line_height, 20)))
+        
         # Tạo ROI từ bên phải của "Nơi thường trú" đến trước "Có giá trị đến"
+        # Mở rộng ROI xuống dưới để lấy đủ các dòng
         roi_x1 = min(rx2 + 2, W - 1)
         roi_x2 = min(W - 1, ex1 - 5)  # Dừng trước anchor "Có giá trị đến"
-        roi_y1 = max(0, ry1 - 10)  # Mở rộng lên trên một chút
-        roi_y2 = min(H, ey1 - 5)  # Dừng trước dòng "Có giá trị đến"
+        roi_y1 = max(0, ry1 - 5)  # Bắt đầu từ dòng residence
+        # Mở rộng xuống dưới để lấy đủ các dòng, nhưng dừng trước expiry
+        roi_y2 = min(H, ey1 - 3)  # Dừng trước dòng "Có giá trị đến", lấy đủ các dòng ở giữa
         
         if roi_x1 < roi_x2 and roi_y1 < roi_y2:
             residence_roi_img = image_bgr[roi_y1:roi_y2, roi_x1:roi_x2]
-            # Đọc với multipass đầy đủ để nhận diện dấu tốt
-            residence_roi, _, _ = _ocr_multipass_text(ocr, residence_roi_img, fast_mode=False)
+            # Dùng hybrid OCR với multipass để nhận diện dấu tốt hơn và lấy đủ các dòng
+            residence_roi, _ = _hybrid_ocr_roi(residence_roi_img, ocr, use_vietocr=True)
             
             if residence_roi:
                 # Loại bỏ ngày tháng ở cuối (nhiều format)
@@ -821,21 +1227,22 @@ def extract_id_fields(image_bgr) -> Dict:
                 residence_roi = re.sub(r"(?i)(^|\s+)(place\s*of\s*residen[ce]|nơi\s*thường\s*trú|noi\s*thuong\s*tru)[\s:：\-|/]*", " ", residence_roi)
                 # Giữ nguyên dấu tiếng Việt, số, dấu phẩy, dấu chấm
                 residence_roi = re.sub(r"[^A-Za-zÀ-ỹ0-9\s,\.]", " ", residence_roi)
-                # Chuẩn hóa khoảng trắng nhưng giữ dấu phẩy
+                # Chuẩn hóa khoảng trắng nhưng giữ dấu phẩy và xuống dòng
                 residence_roi = re.sub(r"\s+", " ", residence_roi)
                 residence_roi = re.sub(r"\s*,\s*", ", ", residence_roi).strip()
                 out["residence"] = _normalize(residence_roi)
     
     # Fallback: dùng cách cũ nếu không tìm thấy cả 2 anchor
+    # Tăng max_lines để lấy đủ các dòng
     if not out.get("residence"):
         residence_roi = _read_right_of_anchor(
             image_bgr,
             ocr,
             items,
             ANCHORS["residence"],
-            max_lines=8,
-            max_gap_px=20,
-            right_pad=60,
+            max_lines=10,  # Tăng từ 8 lên 10 để lấy đủ các dòng
+            max_gap_px=25,  # Tăng gap để lấy được các dòng xa hơn
+            right_pad=80,  # Tăng padding để lấy đủ chiều rộng
             stop_at_date=True,
             stop_after_anchors=ANCHORS["expiry"],
         ) 
@@ -854,11 +1261,11 @@ def extract_id_fields(image_bgr) -> Dict:
             residence_roi = re.sub(r"\s*,\s*", ", ", residence_roi).strip()
             out["residence"] = _normalize(residence_roi)
     if not out.get("residence"):
-        # fallback text-based
+        # fallback text-based - tăng max_lines để lấy đủ các dòng
         residence = collect_after(
             anchors=ANCHORS["residence"],
             stop_keywords=ANCHORS["expiry"] + ANCHORS["issue"] + ANCHORS["gender"],
-            max_lines=5,  # Tăng số dòng để lấy đủ địa chỉ
+            max_lines=8,  # Tăng từ 5 lên 8 để lấy đủ địa chỉ dài
         )
         if residence:
             residence = _remove_anchors(residence, ANCHORS["residence"]) 
