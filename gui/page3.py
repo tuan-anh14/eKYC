@@ -49,8 +49,14 @@ class ChallengeWindow(QDialog):
         self.count_frame = 0
         self.isCorrect = False
         self.count_correct = 0 # đếm số câu hỏi đúng 
-        self.count_delay_frame = 0 # 
-        self.challenge, self.question = get_challenge_and_question()        
+        self.count_delay_frame = 0 # Delay trước khi hiện câu hỏi
+        self.count_question_delay_frame = 0 # Delay 2s sau khi hiện câu hỏi trước khi nhận câu trả lời
+        # Timer chạy mỗi 30ms, nên 2 giây = 2000ms / 30ms ≈ 67 frame
+        self.QUESTION_DELAY_FRAMES = 67
+        # Tạo danh sách 3 thử thách không trùng nhau
+        self.challenges_list = get_unique_challenges(3)
+        self.challenge = self.challenges_list[0]
+        self.question = get_question(self.challenge)        
         
     def rescale_image(self):
         return 640, 480
@@ -70,23 +76,34 @@ class ChallengeWindow(QDialog):
             if self.count_delay_frame < 100:
                 self.count_delay_frame += 1
             else:
-                if self.isCorrect == False and self.count_correct < 3:
-                    self.isCorrect = result_challenge_response(frame, self.challenge, self.question, self.list_models, self.mtcnn)
+                # Hiển thị câu hỏi ngay khi đủ delay
+                if self.count_question_delay_frame == 0:
                     self.update_challenge_label(question = self.question)
+                
+                # Đếm delay 2 giây sau khi hiển thị câu hỏi
+                if self.count_question_delay_frame < self.QUESTION_DELAY_FRAMES:
+                    self.count_question_delay_frame += 1
+                else:
+                    # Sau 2 giây, mới bắt đầu nhận câu trả lời
+                    if self.isCorrect == False and self.count_correct < 3:
+                        self.isCorrect = result_challenge_response(frame, self.challenge, self.question, self.list_models, self.mtcnn)
                     
-                elif self.isCorrect == True and self.count_correct < 3:
-                    self.update_challenge_label(text = "<font color = green>Đúng!</font>")
-                    self.count_frame += 1
+                    elif self.isCorrect == True and self.count_correct < 3:
+                        self.update_challenge_label(text = "<font color = green>Đúng!</font>")
+                        self.count_frame += 1
 
-                    if self.count_frame == 100:
-                        self.count_correct += 1        
-                        self.count_frame = 0
-                        if self.count_correct == 3:
-                            self.update_challenge_label(text = "<font color = green>Bạn đã xác thực danh tính thành công!</font>", coordinates = (600, 650))
-                        else:
-                            self.challenge, self.question = get_challenge_and_question()
-                            self.update_challenge_label(question = self.question)
-                            self.isCorrect = False
+                        if self.count_frame == 100:
+                            self.count_correct += 1        
+                            self.count_frame = 0
+                            if self.count_correct == 3:
+                                self.update_challenge_label(text = "<font color = green>Bạn đã xác thực danh tính thành công!</font>", coordinates = (600, 650))
+                            else:
+                                # Lấy thử thách tiếp theo từ danh sách đã tạo (không trùng)
+                                self.challenge = self.challenges_list[self.count_correct]
+                                self.question = get_question(self.challenge)
+                                # Reset delay để hiển thị câu hỏi mới và đợi 2s trước khi nhận câu trả lời
+                                self.count_question_delay_frame = 0
+                                self.isCorrect = False
                         
     def back_switch_page(self):
         self.main_window.switch_page(1)  
@@ -110,8 +127,12 @@ class ChallengeWindow(QDialog):
         self.isCorrect = False
         self.count_correct = 0
         self.count_delay_frame = 0
+        self.count_question_delay_frame = 0
         
-        self.challenge, self.question = get_challenge_and_question()
+        # Tạo lại danh sách 3 thử thách không trùng nhau
+        self.challenges_list = get_unique_challenges(3)
+        self.challenge = self.challenges_list[0]
+        self.question = get_question(self.challenge)
     
     def update_challenge_label(self, text = None, question = None, coordinates = None):
         assert  not (text is not None and question is not None)

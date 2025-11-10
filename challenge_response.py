@@ -12,7 +12,35 @@ from utils.functions import extract_face
 
 
 def random_challenge():
-    return random.choice(["smile", "surprise", "blink eyes", "right", "left"])
+    return random.choice(["smile", "surprise", "right", "left"])
+
+
+def get_unique_challenges(count=3):
+    """
+    Tạo danh sách các thử thách không trùng lặp.
+    
+    Args:
+        count: Số lượng thử thách cần tạo (mặc định 3)
+        
+    Returns:
+        List[str]: Danh sách các thử thách không trùng lặp
+    """
+    available_challenges = ["smile", "surprise", "right", "left"]
+    # Nếu số lượng yêu cầu lớn hơn số thử thách có sẵn, lặp lại
+    if count > len(available_challenges):
+        # Lặp lại cho đủ số lượng
+        challenges = available_challenges.copy()
+        while len(challenges) < count:
+            remaining = [c for c in available_challenges if c not in challenges[-len(available_challenges):]]
+            if remaining:
+                challenges.extend(remaining)
+            else:
+                # Nếu đã dùng hết, shuffle lại
+                challenges.extend(random.sample(available_challenges, min(len(available_challenges), count - len(challenges))))
+        return challenges[:count]
+    else:
+        # Chọn ngẫu nhiên không trùng
+        return random.sample(available_challenges, count)
 
 
 def get_question(challenge):
