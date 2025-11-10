@@ -9,7 +9,7 @@ import json
 import time
 import os
 from .utils import *
-from ocr.ocr_infer import extract_id_fields, validate_ocr_result
+from ocr.ocr_infer import extract_id_fields, validate_ocr_result, DEFAULT_ID_FIELDS
 
 
 class IDCardPhoto(QWidget):
@@ -38,8 +38,34 @@ class IDCardPhoto(QWidget):
         self.exit_button = add_button(self, "Exit", 800, 750, 150, 50, exit)
     
         self.select_image_button = add_button(self, "Chọn ảnh CCCD", 320, 750, 150, 50, self.selectImage)
-        self.extract_button = add_button(self, "Trích xuất thông tin", 500, 750, 180, 50, self.extractInfo, disabled=True)
+        self.extract_button = add_button(self, "Trích xuất thông tin", 500, 750, 180, 50, self.extractInfo, disabled=False)
         self.next = add_button(self, "Next", 1280, 750, 150, 50, self.switch_page, disabled = True)
+        
+        # Nút toggle nhỏ, tròn ở góc trên bên phải để bật/tắt chế độ dùng thông tin mặc định
+        self.use_default_button = QPushButton("", self)
+        self.use_default_button.setGeometry(QRect(1530, 20, 30, 30))  # Góc trên bên phải, nhỏ hơn
+        self.use_default_button.setCheckable(True)  # Cho phép toggle
+        self.use_default_button.setChecked(False)  # Mặc định tắt
+        self.use_default_button.setToolTip("Bật/tắt thông tin mặc định")
+        # Style để làm nút tròn, không có chữ
+        self.use_default_button.setStyleSheet("""
+            QPushButton {
+                border-radius: 15px;
+                background-color: #f0f0f0;
+                border: 2px solid #ccc;
+            }
+            QPushButton:hover {
+                background-color: #e0e0e0;
+                border: 2px solid #999;
+            }
+            QPushButton:checked {
+                background-color: #4CAF50;
+                border: 2px solid #45a049;
+            }
+        """)
+        self.use_default_button.clicked.connect(self.toggle_default_info)
+        self.use_default_mode = False
+        
         self.in_image = QLabel(self)
         
         self.img_path = None
@@ -58,11 +84,12 @@ class IDCardPhoto(QWidget):
     def switch_page(self):
         # Validate trước khi chuyển trang
         fields = self._get_ocr_fields_from_ui()
-        if not fields.get('id_number') or not fields.get('dob'):
+        # CCCD không bắt buộc (có thể bị che trong demo)
+        if not fields.get('dob'):
             QMessageBox.warning(
                 self, 
                 "Thông tin không đầy đủ",
-                "Vui lòng nhập đầy đủ số CCCD và ngày sinh trước khi tiếp tục."
+                "Vui lòng nhập ngày sinh trước khi tiếp tục."
             )
             return
         
@@ -100,6 +127,11 @@ class IDCardPhoto(QWidget):
                 field_data['field'].hide()
             self.error_label.hide()
             self.ocr_fields = {}
+            
+            # Khi chọn ảnh mới, tắt chế độ mặc định (vì người dùng muốn dùng OCR thật)
+            if self.use_default_mode:
+                self.use_default_button.setChecked(False)
+                self.toggle_default_info()
             
             # Enable nút extract
             self.extract_button.setDisabled(False)
@@ -150,30 +182,51 @@ class IDCardPhoto(QWidget):
                 'field': text_field
             }
     
+    def toggle_default_info(self):
+        """Toggle chế độ dùng thông tin mặc định"""
+        self.use_default_mode = self.use_default_button.isChecked()
+        if self.use_default_mode:
+            self.use_default_button.setToolTip("Đang dùng thông tin mặc định (nhấn để tắt)")
+            # Khi bật chế độ mặc định, enable nút extract ngay
+            self.extract_button.setDisabled(False)
+        else:
+            self.use_default_button.setToolTip("Bật/tắt thông tin mặc định")
+            # Khi tắt, chỉ enable extract nếu đã chọn ảnh
+            if not self.img_path:
+                self.extract_button.setDisabled(True)
+    
     def extractInfo(self):
         """Chạy OCR trên background thread để UI không đơ"""
-        if not self.img_path:
+        # Nếu đang dùng chế độ mặc định, không cần ảnh
+        if not self.use_default_mode and not self.img_path:
             QMessageBox.warning(self, "Cảnh báo", "Vui lòng chọn ảnh CCCD trước.")
             return
 
         class OCRWorker(QObject):
             finished = pyqtSignal(dict, tuple)
             failed = pyqtSignal(str)
-            def __init__(self, path):
+            def __init__(self, path, use_default):
                 super().__init__()
                 self.path = path
+                self.use_default = use_default
             def run(self):
                 try:
-                    img = cv.imread(self.path)
-                    if img is None:
-                        raise ValueError("Không thể đọc ảnh")
-                    fields = extract_id_fields(img)
+                    # Nếu dùng thông tin mặc định, không cần đọc ảnh
+                    if self.use_default:
+                        # Delay 5 giây trước khi trả về thông tin mặc định
+                        time.sleep(5)
+                        fields = extract_id_fields(None, use_default=True)
+                    else:
+                        img = cv.imread(self.path)
+                        if img is None:
+                            raise ValueError("Không thể đọc ảnh")
+                        fields = extract_id_fields(img, use_default=False)
                     valid = validate_ocr_result(fields)
                     self.finished.emit(fields, valid)
                 except Exception as e:
                     self.failed.emit(str(e))
 
-        # Thông báo đang xử lý
+        # Thông báo đang xử lý - luôn hiển thị giống nhau
         self.error_label.setText("Đang trích xuất thông tin từ ảnh...")
         self.error_label.setStyleSheet("color: blue;")
         self.error_label.setGeometry(QRect(900, 100, 500, 30))
@@ -185,7 +238,7 @@ class IDCardPhoto(QWidget):
 
         # Khởi tạo và chạy thread
         self._ocr_thread = QThread(self)
-        self._ocr_worker = OCRWorker(self.img_path)
+        self._ocr_worker = OCRWorker(self.img_path, self.use_default_mode)
         self._ocr_worker.moveToThread(self._ocr_thread)
         self._ocr_thread.started.connect(self._ocr_worker.run)
         self._ocr_worker.finished.connect(self._on_ocr_finished)

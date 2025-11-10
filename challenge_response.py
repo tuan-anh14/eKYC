@@ -17,25 +17,33 @@ def random_challenge():
 
 def get_question(challenge):
     """
-    Generate a question or instruction based on the challenge.
+    Tạo câu hỏi hoặc hướng dẫn dựa trên thử thách.
 
     Parameters:
-        challenge (str): The current challenge, which can be 'smile', 'surprise', 'right', 'left', 'front', or 'blink eyes'.
+        challenge (str): Thử thách hiện tại, có thể là 'smile', 'surprise', 'right', 'left', 'front', hoặc 'blink eyes'.
 
     Returns:
-        str or list: A question or instruction related to the challenge.
-                     If the challenge is 'blink eyes', returns a list containing the instruction and the required number of blinks.
+        str or list: Câu hỏi hoặc hướng dẫn liên quan đến thử thách.
+                     Nếu thử thách là 'blink eyes', trả về list chứa hướng dẫn và số lần chớp mắt yêu cầu.
     """
+    # Mapping challenge sang tiếng Việt
+    challenge_map = {
+        "smile": "cười",
+        "surprise": "ngạc nhiên",
+        "right": "phải",
+        "left": "trái",
+        "front": "trước",
+    }
+    
     if challenge in ["smile", "surprise"]:
-        return "Please put on a {} expression".format(challenge)
+        return "Vui lòng thể hiện biểu cảm {}".format(challenge_map[challenge])
 
     elif challenge in ["right", "left", "front"]:
-        return "Please turn your face to the {}".format(challenge)
+        return "Vui lòng quay mặt về phía {}".format(challenge_map[challenge])
 
     elif challenge == "blink eyes":
-
         num = random.randint(2, 4)
-        return ["Blink your eyes {} times".format(num), num]
+        return ["Chớp mắt {} lần".format(num), num]
 
 
 def get_challenge_and_question():
@@ -72,17 +80,17 @@ def result_challenge_response(
     frame: np.ndarray, challenge: str, question, model: list, mtcnn: MTCNN
 ):
     """
-    Process the response to a challenge based on the input frame.
+    Xử lý phản hồi của người dùng đối với thử thách dựa trên frame đầu vào.
 
     Parameters:
-        frame (np.ndarray): RGB color image.
-        challenge (str): The current challenge, which can be 'smile', 'surprise', 'right', 'left', 'front', or 'blink eyes'.
-        question:  A question or instruction related to the challenge.
-        model (list): List of models used, including [blink_model, face_orientation_model, emotion_model].
-        mtcnn (MTCNN): MTCNN object used for face extraction.
+        frame (np.ndarray): Ảnh màu RGB.
+        challenge (str): Thử thách hiện tại, có thể là 'smile', 'surprise', 'right', 'left', 'front', hoặc 'blink eyes'.
+        question: Câu hỏi hoặc hướng dẫn liên quan đến thử thách.
+        model (list): Danh sách các model được sử dụng, bao gồm [blink_model, face_orientation_model, emotion_model].
+        mtcnn (MTCNN): Đối tượng MTCNN dùng để trích xuất khuôn mặt.
 
     Returns:
-        bool: The result of the challenge (True if correct, False if incorrect).
+        bool: Kết quả của thử thách (True nếu đúng, False nếu sai).
     """
     face, box, landmarks = extract_face(frame, mtcnn, padding=10)
     if box is not None:
@@ -131,7 +139,7 @@ if __name__ == "__main__":
                 if isinstance(question, list):
                     cv.putText(
                         frame,
-                        "Question: {}".format(question[0]),
+                        "Câu hỏi: {}".format(question[0]),
                         (20, 20),
                         cv.FONT_HERSHEY_COMPLEX,
                         0.5,
@@ -141,7 +149,7 @@ if __name__ == "__main__":
                 else:
                     cv.putText(
                         frame,
-                        "Question: {}".format(question),
+                        "Câu hỏi: {}".format(question),
                         (20, 20),
                         cv.FONT_HERSHEY_COMPLEX,
                         0.5,

@@ -17,6 +17,18 @@ from .preprocess import (
 _ocr_instance = None
 _vietocr_instance = None
 
+# Thông tin mặc định (default) cho demo
+DEFAULT_ID_FIELDS = {
+    "id_number": "",
+    "name": "THIÊU TUẤN ANH",
+    "dob": "14/09/2004",
+    "gender": "Nam",
+    "nationality": "Việt Nam",
+    "place_of_origin": "Văn Lý, Lý Nhân, Hà Nam",
+    "residence": "Thôn Quan Văn Văn Lý, Lý Nhân, Hà Nam",
+    "expiry_date": "14/09/2029",
+}
+
 def get_ocr_instance():
     """Lazy initialization của PaddleOCR để tránh load model nhiều lần"""
     global _ocr_instance
@@ -190,19 +202,8 @@ def _parse_paddlex_ocrresult(page, image_bgr) -> List[Tuple[str, float, any, Lis
         texts = getattr(page, 'rec_texts', None) or getattr(page, 'texts', None)
         scores = getattr(page, 'rec_scores', None) or getattr(page, 'scores', None)
         
-        # Debug chi tiết
-        _dbg('_parse_paddlex_ocrresult: boxes type:', type(boxes), 'is None:', boxes is None)
-        _dbg('_parse_paddlex_ocrresult: texts type:', type(texts), 'is None:', texts is None)
-        if boxes is not None:
-            _dbg('_parse_paddlex_ocrresult: boxes length:', len(boxes) if hasattr(boxes, '__len__') else 'N/A')
-        if texts is not None:
-            _dbg('_parse_paddlex_ocrresult: texts length:', len(texts) if hasattr(texts, '__len__') else 'N/A')
-        
         if boxes is None or texts is None:
-            _dbg('_parse_paddlex_ocrresult: boxes or texts is None, trying alternative attributes')
             # Thử các thuộc tính khác
-            if hasattr(page, '__dict__'):
-                _dbg('_parse_paddlex_ocrresult: page.__dict__ keys:', list(page.__dict__.keys()))
             return items
         
         # Convert numpy array to list if needed
@@ -216,8 +217,6 @@ def _parse_paddlex_ocrresult(page, image_bgr) -> List[Tuple[str, float, any, Lis
         
         n = min(len(boxes), len(texts), len(scores) if scores is not None else len(texts))
         H, W = image_bgr.shape[:2]
-        
-        _dbg(f'_parse_paddlex_ocrresult: parsing {n} detections')
         
         for i in range(n):
             try:
@@ -254,81 +253,49 @@ def _parse_paddlex_ocrresult(page, image_bgr) -> List[Tuple[str, float, any, Lis
                 box_standard = [[x1, y1], [x2, y1], [x2, y2], [x1, y2]]
                 items.append((txt, conf, crop, box_standard))
             except Exception as e:
-                _dbg(f'_parse_paddlex_ocrresult: exception at index {i}:', str(e))
                 continue
         
-        _dbg(f'_parse_paddlex_ocrresult: parsed {len(items)} items')
     except Exception as e:
-        _dbg('_parse_paddlex_ocrresult: exception:', str(e))
+        pass
     return items
 
 def _ocr_collect_with_crops(ocr: PaddleOCR, image_bgr) -> List[Tuple[str, float, any, List[List[int]]]]:
     """Thu thập (text, conf, crop_bgr, box) từ PaddleOCR."""
     items: List[Tuple[str, float, any, List[List[int]]]] = []
     
-    # Debug: Kiểm tra image
     if image_bgr is None:
-        _dbg('_ocr_collect_with_crops: image_bgr is None')
         return items
-    _dbg('_ocr_collect_with_crops: image shape:', image_bgr.shape if hasattr(image_bgr, 'shape') else 'no shape')
     
     # Đảm bảo image là BGR
     image_bgr = _ensure_bgr(image_bgr)
     
     result = None
     try:
-        # Bỏ cls=True vì không được hỗ trợ trong một số version
-        _dbg('_ocr_collect_with_crops: calling ocr.ocr')
         result = ocr.ocr(image_bgr)
-        _dbg('_ocr_collect_with_crops: ocr.ocr returned, type:', type(result))
     except Exception as e:
-        _dbg('_ocr_collect_with_crops: ocr.ocr failed:', str(e))
         try:
-            _dbg('_ocr_collect_with_crops: trying ocr.predict')
             result = ocr.predict(image_bgr)
-            _dbg('_ocr_collect_with_crops: ocr.predict returned, type:', type(result))
         except Exception as e2:
-            _dbg('_ocr_collect_with_crops: ocr.predict also failed:', str(e2))
             return items
     
     if result is None:
-        _dbg('_ocr_collect_with_crops: result is None')
         return items
-    
-    _dbg('_ocr_collect_with_crops: result type:', type(result), 'is_list:', isinstance(result, list))
     
     if not isinstance(result, list):
-        _dbg('_ocr_collect_with_crops: result is not a list, returning empty')
         return items
-    
-    _dbg('_ocr_collect_with_crops: result length:', len(result))
     
     # Xử lý OCRResult từ PaddleX
     if len(result) == 1:
         page = result[0]
         # Kiểm tra nếu là OCRResult từ PaddleX
         if type(page).__name__ == 'OCRResult' or hasattr(page, 'rec_texts') or hasattr(page, 'boxes'):
-            _dbg('_ocr_collect_with_crops: detected OCRResult format, parsing...')
-            # Debug: Kiểm tra OCRResult có gì
-            _dbg('_ocr_collect_with_crops: OCRResult attributes:', dir(page))
-            if hasattr(page, 'boxes'):
-                _dbg('_ocr_collect_with_crops: page.boxes type:', type(getattr(page, 'boxes', None)), 'value:', getattr(page, 'boxes', None))
-            if hasattr(page, 'rec_texts'):
-                _dbg('_ocr_collect_with_crops: page.rec_texts type:', type(getattr(page, 'rec_texts', None)), 'value:', getattr(page, 'rec_texts', None))
-            if hasattr(page, 'dt_polys'):
-                _dbg('_ocr_collect_with_crops: page.dt_polys type:', type(getattr(page, 'dt_polys', None)), 'value:', getattr(page, 'dt_polys', None))
-            
             parsed_items = _parse_paddlex_ocrresult(page, image_bgr)
             if parsed_items:
                 items.extend(parsed_items)
-                _dbg('_ocr_collect_with_crops: final items count (OCRResult):', len(items))
                 return items
             else:
                 # Nếu OCRResult không có dữ liệu, fallback về xử lý format chuẩn
-                _dbg('_ocr_collect_with_crops: OCRResult parsing returned empty, falling back to standard format')
-                # Kiểm tra xem page có phải là list không (format chuẩn)
                 if isinstance(page, list):
-                    _dbg('_ocr_collect_with_crops: page is list, processing as standard format')
                     # Xử lý như format chuẩn
                     for det_idx, det in enumerate(page):
                         try:
@@ -346,29 +313,19 @@ def _ocr_collect_with_crops(ocr: PaddleOCR, image_bgr) -> List[Tuple[str, float,
                             crop = image_bgr[y1:y2, x1:x2]
                             items.append((txt, conf, crop, box))
                         except Exception as e:
-                            _dbg(f'_ocr_collect_with_crops: det {det_idx} exception:', str(e))
                             continue
                     if items:
-                        _dbg('_ocr_collect_with_crops: collected items from fallback:', len(items))
                         return items
     
     # PaddleOCR format chuẩn: [[[box, (text, conf)], ...]]
-    page_count = 0
     for page_idx, page in enumerate(result):
-        page_count += 1
-        _dbg(f'_ocr_collect_with_crops: page {page_idx}, type:', type(page))
-        
         if isinstance(page, dict):
             # Format dict: {'ocr_result': [...]}
             ocr_result = page.get('ocr_result', [])
-            _dbg(f'_ocr_collect_with_crops: page {page_idx} is dict, ocr_result length:', len(ocr_result))
             page = ocr_result
         
         if not isinstance(page, list):
-            _dbg(f'_ocr_collect_with_crops: page {page_idx} is not a list, skipping')
             continue
-        
-        _dbg(f'_ocr_collect_with_crops: page {page_idx} length:', len(page))
         
         for det_idx, det in enumerate(page):
             try:
@@ -393,10 +350,8 @@ def _ocr_collect_with_crops(ocr: PaddleOCR, image_bgr) -> List[Tuple[str, float,
                 crop = image_bgr[y1:y2, x1:x2]
                 items.append((txt, conf, crop, box))
             except Exception as e:
-                _dbg(f'_ocr_collect_with_crops: det {det_idx} exception:', str(e))
                 continue
     
-    _dbg('_ocr_collect_with_crops: final items count:', len(items), 'page_count:', page_count)
     return items
 
 
@@ -427,7 +382,6 @@ def _ocr_with_vietocr(image_bgr, use_vietocr: bool = True) -> Optional[str]:
         result = viet.predict(image_rgb)
         return str(result) if result else None
     except Exception as e:
-        _dbg('VietOCR error:', str(e))
         return None
 
 def _hybrid_ocr_roi(image_bgr, ocr: PaddleOCR, use_vietocr: bool = True) -> Tuple[str, float]:
@@ -451,21 +405,13 @@ def _hybrid_ocr_roi(image_bgr, ocr: PaddleOCR, use_vietocr: bool = True) -> Tupl
             # VietOCR không có confidence, ước tính dựa trên độ dài và số ký tự tiếng Việt
             estimated_conf = min(0.95, 0.75 + (viet_count / max(1, len(viet_text))) * 0.2)
             candidates.append((viet_text, estimated_conf, viet_count))
-            _dbg('VietOCR result:', viet_text[:100] + '...' if len(viet_text) > 100 else viet_text, 'viet_count:', viet_count)
-        else:
-            _dbg('VietOCR returned None or empty')
-    else:
-        _dbg('VietOCR disabled (use_vietocr=False)')
     
     if not candidates:
-        _dbg('No OCR candidates found')
         return "", 0.0
     
     # Chọn kết quả tốt nhất: ưu tiên có nhiều ký tự tiếng Việt có dấu
     # Score = viet_count * 0.7 + confidence * 0.3 (ưu tiên cao hơn cho tiếng Việt)
     best_text, best_conf, best_viet_count = max(candidates, key=lambda x: (x[2] * 0.7 + x[1] * 0.3))
-    _dbg('Hybrid OCR selected:', best_text[:100] + '...' if len(best_text) > 100 else best_text, 
-         'viet_count:', best_viet_count, 'conf:', f'{best_conf:.2f}')
     return best_text, best_conf
 
 def _ocr_multipass_text(ocr: PaddleOCR, image_bgr, fast_mode: bool = False, use_vietocr: bool = False) -> Tuple[str, float, List[str]]:
@@ -494,9 +440,8 @@ def _ocr_multipass_text(ocr: PaddleOCR, image_bgr, fast_mode: bool = False, use_
             avg0 = sum(confs0) / max(1, len(confs0))
             viet_count0 = _count_vietnamese_chars(text0)
             candidates.append((text0, avg0, lines0, viet_count0))
-            _dbg('Pass 0 (simple BW):', text0[:50] + '...' if len(text0) > 50 else text0, 'conf:', f'{avg0:.2f}')
     except Exception as e:
-        _dbg('Pass 0 (simple BW) failed:', str(e))
+        pass
     
     # Pass 1: resize mềm để tăng chiều cao chữ (pass này thường tốt nhất cho tiếng Việt)
     img1 = resize_keep_aspect(image_bgr, height=256)
@@ -541,7 +486,7 @@ def _ocr_multipass_text(ocr: PaddleOCR, image_bgr, fast_mode: bool = False, use_
             viet_count3 = _count_vietnamese_chars(text3)
             candidates.append((text3, avg3, lines3, viet_count3))
     except Exception as e:
-        _dbg('Preprocess v4 failed:', str(e))
+        pass
     
     # Pass 4: Preprocessing v5 (bilateral filter) - tốt cho ảnh chất lượng thấp
     try:
@@ -555,7 +500,7 @@ def _ocr_multipass_text(ocr: PaddleOCR, image_bgr, fast_mode: bool = False, use_
             viet_count4 = _count_vietnamese_chars(text4)
             candidates.append((text4, avg4, lines4, viet_count4))
     except Exception as e:
-        _dbg('Preprocess v5 failed:', str(e))
+        pass
     
     # Pass 5: thử VietOCR nếu được yêu cầu và có ít ký tự tiếng Việt
     if use_vietocr:
@@ -699,15 +644,9 @@ def _find_anchor_box(items, anchors: List[str], alt_tokens: List[str]) -> Option
     """Tìm box nhãn: ưu tiên khớp full anchor; nếu không, khớp theo từ khoá rời (alt_tokens)."""
     candidates = []
     
-    # Debug: Log một số items đầu tiên để xem text được OCR ra
-    if len(items) > 0:
-        sample_texts = [txt[:50] for txt, _, _, _ in items[:5]]
-        _dbg('Sample OCR texts:', sample_texts)
-    
     # Ưu tiên 1: Tìm khớp full anchor trong từng item
     for txt, conf, crop, box in items:
         if _is_anchor(txt, anchors):
-            _dbg('Found anchor (priority 1):', txt[:50], 'for anchors:', anchors[:2])
             candidates.append((box, 1))  # Priority 1: full match
     
     # Ưu tiên 2: Tìm theo token rời trong từng item
@@ -716,17 +655,14 @@ def _find_anchor_box(items, anchors: List[str], alt_tokens: List[str]) -> Option
             nt = _norm_no_accents(txt)
             matched_tokens = [tok for tok in alt_tokens if tok in nt]
             if matched_tokens:
-                _dbg('Found anchor (priority 2):', txt[:50], 'matched tokens:', matched_tokens)
                 candidates.append((box, 2))  # Priority 2: token match
     
     # Ưu tiên 3: Ghép các item thành dòng và tìm anchor trên dòng
     if not candidates:
         grouped_lines = _group_lines(items)
-        _dbg('Grouped lines count:', len(grouped_lines))
         for line_text, rects in grouped_lines:
             line_norm = _norm_no_accents(line_text)
             if _is_anchor(line_text, anchors):
-                _dbg('Found anchor (priority 3 - line):', line_text[:80], 'for anchors:', anchors[:2])
                 # lấy union rect của các rects thuộc dòng
                 xs1 = [r[0] for r in rects]; ys1 = [r[1] for r in rects]
                 xs2 = [r[2] for r in rects]; ys2 = [r[3] for r in rects]
@@ -737,7 +673,6 @@ def _find_anchor_box(items, anchors: List[str], alt_tokens: List[str]) -> Option
                 # Thử tìm theo token trong dòng
                 matched_tokens = [tok for tok in alt_tokens if tok in line_norm]
                 if matched_tokens:
-                    _dbg('Found anchor (priority 3 - line token):', line_text[:80], 'matched tokens:', matched_tokens)
                     xs1 = [r[0] for r in rects]; ys1 = [r[1] for r in rects]
                     xs2 = [r[2] for r in rects]; ys2 = [r[3] for r in rects]
                     ax1, ay1, ax2, ay2 = min(xs1), min(ys1), max(xs2), max(ys2)
@@ -747,10 +682,8 @@ def _find_anchor_box(items, anchors: List[str], alt_tokens: List[str]) -> Option
     if candidates:
         # Sắp xếp theo priority (thấp hơn = tốt hơn), sau đó theo x
         candidates.sort(key=lambda x: (x[1], _box_to_rect(x[0])[0]))
-        _dbg('Anchor found, returning box')
         return candidates[0][0]
     
-    _dbg('No anchor found after all attempts, items count:', len(items))
     return None
 
 def _box_to_rect(box: List[List[int]]) -> Tuple[int, int, int, int]:
@@ -817,7 +750,6 @@ def _read_right_of_anchor(image_bgr, ocr: PaddleOCR, items, anchors: List[str], 
     )
     anchor_box = _find_anchor_box(items, anchors, alt_map.get(key, []))
     if anchor_box is None:
-        _dbg('no_anchor_found_for', anchors[:2])
         # Nếu không tìm thấy anchor, vẫn cố gắng tạo ROI dựa trên vị trí ước tính
         # Dựa trên vị trí trung bình của các items để tạo ROI
         if not items:
@@ -838,7 +770,6 @@ def _read_right_of_anchor(image_bgr, ocr: PaddleOCR, items, anchors: List[str], 
         # Nếu vẫn không tìm thấy, dùng box đầu tiên làm anchor ước tính
         if anchor_box is None and items:
             anchor_box = items[0][3]  # Lấy box của item đầu tiên
-            _dbg('using_first_item_as_anchor_estimate')
         
         if anchor_box is None:
             return ""
@@ -857,7 +788,6 @@ def _read_right_of_anchor(image_bgr, ocr: PaddleOCR, items, anchors: List[str], 
             if _is_date_pattern(txt):
                 x1, y1, x2, y2 = _box_to_rect(box)
                 date_box_y = (y1 + y2) // 2
-                _dbg('found_date_box', txt, date_box_y)
                 break
 
     # Nếu có stop_after_anchors (ví dụ: "Có giá trị đến"), dừng trước nhãn đó
@@ -892,7 +822,6 @@ def _read_right_of_anchor(image_bgr, ocr: PaddleOCR, items, anchors: List[str], 
                 is_in_stop_zone = True
                 break
         if is_in_stop_zone:
-            _dbg('skipping_box_in_stop_zone', txt)
             continue
         
         # Nếu có date_box_y hoặc stop_anchor_y và box này nằm sau mốc dừng, bỏ qua
@@ -903,7 +832,6 @@ def _read_right_of_anchor(image_bgr, ocr: PaddleOCR, items, anchors: List[str], 
             # Cho phép lấy đủ các dòng trước "Có giá trị đến" (giảm threshold)
             stop_y = min(stop_y, stop_anchor_y - 5) if stop_y is not None else (stop_anchor_y - 5)
         if stop_y is not None and my >= stop_y:
-            _dbg('skipping_box_after_stop', txt)
             continue
         
         # Tính khoảng cách theo chiều dọc từ anchor
@@ -936,7 +864,6 @@ def _read_right_of_anchor(image_bgr, ocr: PaddleOCR, items, anchors: List[str], 
         for box in all_candidate_boxes[1:]:
             # Kiểm tra nếu box này chứa ngày tháng, dừng lại
             if stop_at_date and _is_date_pattern(box[5]):
-                _dbg('stopping_at_date_in_line', box[5])
                 break
             # Cải thiện logic nhóm dòng: sử dụng threshold động dựa trên chiều cao dòng
             line_gap_threshold = line_height * 0.7  # 70% chiều cao dòng
@@ -1018,18 +945,29 @@ def _read_right_of_anchor(image_bgr, ocr: PaddleOCR, items, anchors: List[str], 
         # Với ROI nhỏ, vẫn dùng multipass nhưng có thể thử VietOCR nếu cần
         use_fast = roi.shape[0] * roi.shape[1] < 50000
         text, conf, _ = _ocr_multipass_text(ocr, roi, fast_mode=use_fast, use_vietocr=False)
-    _dbg('roi_text', text, 'max_lines:', max_lines, 'use_hybrid:', use_hybrid)
     return _normalize(text)
 
 
-def extract_id_fields(image_bgr) -> Dict:
+def extract_id_fields(image_bgr=None, use_default: bool = False) -> Dict:
     """
-    Input: ảnh BGR (cv2.imread hoặc numpy array)
+    Input: ảnh BGR (cv2.imread hoặc numpy array), có thể None nếu use_default=True
     Output: dict {
         id_number, name, dob, gender, nationality, 
         place_of_origin, residence, issue_date, expiry_date
     }
+    
+    Args:
+        image_bgr: Ảnh BGR, có thể None nếu use_default=True
+        use_default: Nếu True, trả về thông tin mặc định thay vì chạy OCR
     """
+    # Nếu dùng thông tin mặc định, trả về ngay
+    if use_default:
+        return DEFAULT_ID_FIELDS.copy()
+    
+    # Kiểm tra image_bgr nếu không dùng default
+    if image_bgr is None:
+        raise ValueError("image_bgr không được None khi use_default=False")
+    
     ocr = get_ocr_instance()
     # Pass 1: full text phục vụ số/ngày (dùng fast_mode để tăng tốc)
     full, avg_conf, lines = _ocr_multipass_text(ocr, image_bgr, fast_mode=True)
@@ -1065,7 +1003,6 @@ def extract_id_fields(image_bgr) -> Dict:
     
     # Họ tên / Name: Tìm anchor và đọc trực tiếp ROI với multipass đầy đủ
     items = _ocr_collect_with_crops(ocr, image_bgr)
-    _dbg('Total OCR items collected:', len(items))
     name_anchor_box = _find_anchor_box(items, ANCHORS["name"], ['full', 'name', 'ho', 'ten', 'họ', 'tên'])
     
     if name_anchor_box:
@@ -1115,15 +1052,6 @@ def extract_id_fields(image_bgr) -> Dict:
                     name_text, _ = _hybrid_ocr_roi(name_roi_img, ocr, use_vietocr=True)
             except Exception:
                 name_text, _ = _hybrid_ocr_roi(name_roi_img, ocr, use_vietocr=True)
-            
-            # Debug: Kiểm tra text OCR đọc được (trước khi xử lý)
-            if name_text:
-                _dbg('Name OCR raw text (before cleaning):', name_text)
-                _dbg('Name has uppercase Vietnamese diacritics:', any(ord(c) >= 0x00C0 and ord(c) <= 0x1EF9 and c.isupper() for c in name_text))
-                # Kiểm tra từng ký tự
-                for char in name_text:
-                    if char.isupper() and ord(char) >= 0x00C0 and ord(char) <= 0x1EF9:
-                        _dbg(f'Found uppercase Vietnamese char: {char} (U+{ord(char):04X})')
             
             if name_text:
                 # Loại bỏ nhãn MẠNH HƠN - loại bỏ cả "H và tên" ở đầu (không phân biệt hoa thường)
@@ -1471,11 +1399,6 @@ def extract_id_fields(image_bgr) -> Dict:
         residence_text_boxes.sort(key=lambda x: x[2])
         
         if residence_text_boxes:
-            # Debug: Log số lượng box tìm được
-            _dbg(f'Found {len(residence_text_boxes)} residence text boxes')
-            for i, (txt, conf, y) in enumerate(residence_text_boxes):
-                _dbg(f'  Box {i}: y={y}, text="{txt[:50]}"')
-            
             # Ghép text từ các box, loại bỏ label
             residence_parts = []
             for txt, conf, y_pos in residence_text_boxes:
@@ -1494,7 +1417,6 @@ def extract_id_fields(image_bgr) -> Dict:
             if residence_parts:
                 # Ghép các phần với khoảng trắng, giữ nguyên thứ tự
                 residence_text = " ".join(residence_parts)
-                _dbg(f'Combined residence text: "{residence_text[:100]}"')
                 # Loại bỏ ngày tháng nếu có
                 residence_text = re.sub(r'\b\d{1,2}[\/\- ]\d{1,2}[\/\- ]\d{4}.*$', '', residence_text).strip()
                 # Làm sạch
@@ -1763,9 +1685,11 @@ def validate_ocr_result(fields: Dict) -> Tuple[bool, Optional[str]]:
     """
     Validate kết quả OCR - kiểm tra các trường bắt buộc
     Returns: (is_valid, error_message)
+    Note: CCCD không bắt buộc (có thể bị che trong demo)
     """
-    if not fields.get("id_number"):
-        return False, "Không tìm thấy số CCCD. Vui lòng chụp lại ảnh rõ ràng, thẳng góc."
+    # CCCD không bắt buộc (có thể bị che trong demo)
+    # if not fields.get("id_number"):
+    #     return False, "Không tìm thấy số CCCD. Vui lòng chụp lại ảnh rõ ràng, thẳng góc."
     
     if not fields.get("dob"):
         return False, "Không tìm thấy ngày sinh. Vui lòng chụp lại ảnh rõ ràng, thẳng góc."
