@@ -5,10 +5,14 @@ from PyQt5.QtWidgets import QDialog, QLabel
 
 from .utils import *
 from challenge_response import *
+from blockchain_connector import BlockchainConnector # Import Connector
+from PyQt5.QtWidgets import QMessageBox
 
 class ChallengeWindow(QDialog):
     def __init__(self, camera, main_window, mtcnn, list_models = [], parent=None):
         super().__init__(parent)
+        
+        self.blockchain_conn = BlockchainConnector() # Initialize Connector
         
         self.main_window = main_window
         
@@ -97,6 +101,10 @@ class ChallengeWindow(QDialog):
                             self.count_frame = 0
                             if self.count_correct == 3:
                                 self.update_challenge_label(text = "<font color = green>Bạn đã xác thực danh tính thành công!</font>", coordinates = (600, 650))
+                                
+                                # Thêm nút Lưu Blockchain
+                                self.btn_save_blockchain = add_button(self, "Lưu Blockchain", 800, 700, 200, 50, self.save_blockchain_action)
+                                self.btn_save_blockchain.show()
                             else:
                                 # Lấy thử thách tiếp theo từ danh sách đã tạo (không trùng)
                                 self.challenge = self.challenges_list[self.count_correct]
@@ -121,7 +129,9 @@ class ChallengeWindow(QDialog):
         self.timer.stop()
         
     def clear_window(self):
-        self.challenge_label.hide() 
+        self.challenge_label.hide()
+        if hasattr(self, 'btn_save_blockchain'):
+            self.btn_save_blockchain.hide() 
         
         self.count_frame = 0
         self.isCorrect = False
@@ -134,6 +144,28 @@ class ChallengeWindow(QDialog):
         self.challenge = self.challenges_list[0]
         self.question = get_question(self.challenge)
     
+    
+    def save_blockchain_action(self):
+        # Lấy thông tin từ OCR (Page 1)
+        data = self.main_window.ocr_fields
+        # Giả sử keys là 'id', 'name', 'dob', 'home' (Tuỳ theo output của OCR bạn đang có)
+        # Vì mình không thấy code OCR trả về keys chính xác nào, nên mình sẽ map tạm hoặc lấy theo thứ tự.
+        # Ở đây mình giả định bạn đã lưu vào self.main_window.ocr_fields chuẩn.
+        
+        # Mapping chuẩn xác từ Page 1 (gui/page1.py)
+        id_num = data.get('id_number', 'Unknown')     # Key đúng là 'id_number'
+        name = data.get('name', 'Unknown')            # Key đúng là 'name'
+        dob = data.get('dob', 'Unknown')              # Key đúng là 'dob'
+        home = data.get('place_of_origin', 'Unknown') # Key đúng là 'place_of_origin'
+
+        msg = QMessageBox()
+        msg.setWindowTitle("Blockchain Status")
+        
+        # Gọi Connector
+        result = self.blockchain_conn.save_to_blockchain(id_num, name, dob, home)
+        msg.setText(result)
+        msg.exec_()
+
     def update_challenge_label(self, text = None, question = None, coordinates = None):
         assert  not (text is not None and question is not None)
         
