@@ -53,29 +53,45 @@ contract dEkycStorage {
     }
 
     constructor() {
-        // Người deploy contract sẽ là Admin
+        // --- THIẾT LẬP VAI TRÒ (ROLE SETUP) ---
+        
+        // 1. Admin = ÔNG BẢO VỆ (Gatekeeper)
+        // Người deploy contract sẽ là Admin. 
+        // Nhiệm vụ: Chỉ giữ danh sách "Thẻ ra vào" (approvedBanks).
+        // Admin KHÔNG TRỰC TIẾP đi lấy data, KHÔNG được gọi hàm addCustomer (trừ khi tự cấp quyền).
         admin = msg.sender;
-        // Tự cấp quyền cho chính mình để test (Vừa là Admin vừa là Bank A)
-        approvedBanks[msg.sender] = true; 
+
+        // Lưu ý: Để đảm bảo mô hình "Chuẩn chuyên nghiệp", ta KHÔNG tự cấp quyền Bank cho Admin.
+        // Admin muốn nhập liệu phải tự gọi registerBank(admin) hoặc cấp cho ví khác.
     }
 
-    // --- QUẢN TRỊ HỆ THỐNG (ADMIN) ---
+    // --- DATA MARKETPLACE (TOKEN ECONOMY) ---
+    mapping(address => uint256) public tokenBalance; // Ví Token của các ngân hàng
+    uint256 public constant REWARD_AMOUNT = 10; // Thưởng 10 Token khi đóng góp data
+    uint256 public constant READ_FEE = 5;       // Phí 5 Token khi tra cứu data
 
-    // Admin cấp phép cho một Ngân hàng mới tham gia mạng lưới
+    event TokenReward(address indexed bank, uint256 amount);
+    event TokenCharge(address indexed bank, uint256 amount);
+
+    // --- QUẢN TRỊ HỆ THỐNG (ADMIN ONLY) ---
+
+    // Admin cấp "Thẻ ra vào" cho Ngân hàng + Tặng 100 Token làm vốn
     function registerBank(address _bankAddress) public onlyAdmin {
         approvedBanks[_bankAddress] = true;
+        tokenBalance[_bankAddress] = 100; // Tặng vốn khởi nghiệp
         emit BankAdded(_bankAddress);
     }
 
-    // Admin thu hồi quyền của một Ngân hàng (nếu phát hiện gian lận)
+    // Admin thu hồi quyền của một Ngân hàng
     function removeBank(address _bankAddress) public onlyAdmin {
         approvedBanks[_bankAddress] = false;
+        tokenBalance[_bankAddress] = 0; // Tịch thu tài sản
         emit BankRemoved(_bankAddress);
     }
 
     // --- NGHIỆP VỤ NGÂN HÀNG (BANK) ---
 
-    // 1. Xác thực mới: Ngân hàng đẩy dữ liệu khách hàng ok lên Blockchain
+    // 1. GHI DỮ LIỆU (WRITE) -> ĐƯỢC THƯỞNG TIỀN
     function addCustomer(
         string memory _idNumber, 
         string memory _fullName, 
@@ -100,6 +116,10 @@ contract dEkycStorage {
             verifier: msg.sender
         });
 
+        // CỘNG TIỀN THƯỞNG
+        tokenBalance[msg.sender] += REWARD_AMOUNT;
+        emit TokenReward(msg.sender, REWARD_AMOUNT);
+
         emit IdentityVerified(_idNumber, _fullName, msg.sender);
     }
 
@@ -117,20 +137,27 @@ contract dEkycStorage {
         emit IdentityRevoked(_idNumber, msg.sender, _reason);
     }
 
-    // --- TRA CỨU CÔNG KHAI (PUBLIC) ---
+    // --- TRA CỨU MẤT PHÍ (PAID READ) ---
 
-    // Bất kỳ ai cũng có thể kiểm tra trạng thái
-    function checkCustomer(string memory _idNumber) public view returns (
+    // Lưu ý: Đã bỏ từ khóa 'view' vì hàm này sẽ trừ tiền (thay đổi state)
+    function checkCustomer(string memory _idNumber) public onlyBank returns (
         string memory fullName,
         string memory dateOfBirth,
         string memory homeTown,
-        string memory statusString, // Trả về text cho dễ đọc trên giao diện
+        string memory statusString, 
         uint256 verifiedAt,
         address verifiedBy
     ) {
+        // TRỪ TIỀN PHÍ (Nếu không phải chính chủ)
+        // Logic: "Hàng nhà làm" thì được xem miễn phí. Người ngoài xem mới mất tiền.
         Identity memory i = identities[_idNumber];
-        
         require(i.status != IdentityStatus.NOT_FOUND, "Khach hang nay chua co du lieu tren Blockchain");
+
+        if (msg.sender != i.verifier) {
+             require(tokenBalance[msg.sender] >= READ_FEE, "Khong du Token de tra cuu du lieu!");
+             tokenBalance[msg.sender] -= READ_FEE;
+             emit TokenCharge(msg.sender, READ_FEE);
+        }
 
         string memory stt = "UNKNOWN";
         if (i.status == IdentityStatus.VERIFIED) {

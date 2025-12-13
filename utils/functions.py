@@ -60,6 +60,9 @@ def extract_face(img: np.ndarray, model: MTCNN, padding=None, min_prob=0.9):
     if boxes is not None:
         boxes = boxes[prob > min_prob]
 
+        if len(boxes) == 0:
+            return img, None, None
+
         max_area = 0
         max_box = [0, 0, 0, 0]
         max_landmarks = []

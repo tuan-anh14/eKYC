@@ -12,7 +12,7 @@ from utils.functions import extract_face
 
 
 def random_challenge():
-    return random.choice(["smile", "surprise", "right", "left"])
+    return random.choice(["smile", "right", "left"])
 
 
 def get_unique_challenges(count=3):
@@ -25,7 +25,7 @@ def get_unique_challenges(count=3):
     Returns:
         List[str]: Danh sách các thử thách không trùng lặp
     """
-    available_challenges = ["smile", "surprise", "right", "left"]
+    available_challenges = ["smile", "right", "left"]
     # Nếu số lượng yêu cầu lớn hơn số thử thách có sẵn, lặp lại
     if count > len(available_challenges):
         # Lặp lại cho đủ số lượng
@@ -48,7 +48,7 @@ def get_question(challenge):
     Tạo câu hỏi hoặc hướng dẫn dựa trên thử thách.
 
     Parameters:
-        challenge (str): Thử thách hiện tại, có thể là 'smile', 'surprise', 'right', 'left', 'front', hoặc 'blink eyes'.
+        challenge (str): Thử thách hiện tại, có thể là 'smile', 'right', 'left', 'front', hoặc 'blink eyes'.
 
     Returns:
         str or list: Câu hỏi hoặc hướng dẫn liên quan đến thử thách.
@@ -57,13 +57,12 @@ def get_question(challenge):
     # Mapping challenge sang tiếng Việt
     challenge_map = {
         "smile": "cười",
-        "surprise": "ngạc nhiên",
         "right": "phải",
         "left": "trái",
         "front": "trước",
     }
     
-    if challenge in ["smile", "surprise"]:
+    if challenge in ["smile"]:
         return "Vui lòng thể hiện biểu cảm {}".format(challenge_map[challenge])
 
     elif challenge in ["right", "left", "front"]:
@@ -103,6 +102,7 @@ def emotion_response(face, challenge: str, model: EmotionPredictor):
 
     return emotion == challenge
 
+# ... existing code ...
 
 def result_challenge_response(
     frame: np.ndarray, challenge: str, question, model: list, mtcnn: MTCNN
@@ -112,7 +112,7 @@ def result_challenge_response(
 
     Parameters:
         frame (np.ndarray): Ảnh màu RGB.
-        challenge (str): Thử thách hiện tại, có thể là 'smile', 'surprise', 'right', 'left', 'front', hoặc 'blink eyes'.
+        challenge (str): Thử thách hiện tại, có thể là 'smile', 'right', 'left', 'front', hoặc 'blink eyes'.
         question: Câu hỏi hoặc hướng dẫn liên quan đến thử thách.
         model (list): Danh sách các model được sử dụng, bao gồm [blink_model, face_orientation_model, emotion_model].
         mtcnn (MTCNN): Đối tượng MTCNN dùng để trích xuất khuôn mặt.
@@ -122,7 +122,7 @@ def result_challenge_response(
     """
     face, box, landmarks = extract_face(frame, mtcnn, padding=10)
     if box is not None:
-        if challenge in ["smile", "surprise"]:
+        if challenge in ["smile"]:
             isCorrect = emotion_response(face, challenge, model[2])
 
         elif challenge in ["right", "left", "front"]:
