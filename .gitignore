@@ -8,4 +8,7 @@ results/
 *.ipynb
 tests/test1.jpg
 tests/test2.jpg
+tests/test.jpg
 .env
+
+tests
